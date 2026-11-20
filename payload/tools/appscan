@@ -1,0 +1,1070 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""appscan — 扫描 LUVE / SteamWine 的 Wine 环境，列出所有可启动应用。
+
+用法:
+  appscan                扫描（排除 kind=system 的系统组件）
+  appscan --all          连系统组件一起输出
+  appscan --no-icons     不提取 PE 图标（最快）
+  appscan --cache PATH   指定结果缓存文件（默认 $PAY/art/appscan.json）
+
+输出: UTF-8 JSON（缩进 2，末尾带换行）到 stdout；诊断信息只走 stderr。
+只用 Python 3.9 标准库，无第三方依赖。
+"""
+
+import glob
+import hashlib
+import json
+import os
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+
+PAY = os.path.expanduser("~/Library/Application Support/SteamWine")
+
+PREFIX_DIR = os.path.join(PAY, "SharedSupport", "prefix")
+PREFIX_DRIVE_C = os.path.join(PREFIX_DIR, "drive_c")
+BOTTLES_DIR = os.path.join(PAY, "SharedSupport", "bottles")
+RECIPES_DIR = os.path.join(PAY, "recipes")
+PLAYTIME_JSON = os.path.join(PAY, "playtime.json")
+ART_DIR = os.path.join(PAY, "art")
+ART_APPS_DIR = os.path.join(ART_DIR, "apps")
+DEFAULT_CACHE = os.path.join(ART_DIR, "appscan.json")
+
+STEAM_REL = "Program Files (x86)/Steam"
+STEAM_EXE_REL = STEAM_REL + "/Steam.exe"
+STEAM_COMMON_REL = STEAM_REL + "/steamapps/common"
+
+MAX_WALK_DEPTH = 4          # 从 drive_c 起最多向下走 4 层目录
+MAX_PE_SIZE = 64 * 1024 * 1024   # 大于 64MB 的 exe 跳过图标
+MAX_ICON_BYTES = 8 * 1024 * 1024  # 单条 RT_ICON 上限
+ICON_LIMIT = 120            # 最多给前 120 个非系统应用提取图标
+ICON_BUDGET_SEC = 18.0      # 图标阶段时间预算（秒），超了就停止提取
+SIPS = "/usr/bin/sips"
+
+KIND_WEIGHT = {"game": 0, "steam": 1, "app": 2, "tool": 3, "system": 4}
+
+# 系统组件目录（前 6 条为约定规则，后面是实际 prefix 里见到的 Windows 自带程序）
+SYSTEM_PATH_MARKERS = (
+    "/windows/",
+    "/program files/common files/",
+    "/program files (x86)/common files/",
+    "/programdata/",
+    "/users/public/",
+    "/windows.old/",
+    "/internet explorer/",
+    "/windows media player/",
+    "/windows nt/",
+    "/windows mail/",
+    "/windows photo viewer/",
+    "/windows sidebar/",
+)
+
+# 系统组件文件名（含 Steam 自带辅助 exe；recipes 命中的 exe 已在前面判成 game）
+SYSTEM_NAME_PATTERNS = (
+    "unins*",
+    "vcredist*",
+    "vc_redist*",
+    "dxsetup",
+    "dxwebsetup",
+    "setup",
+    "install",
+    "update",
+    "crashhandler",
+    "crashreport",
+    "crashpad",
+    "epicwebhelper",
+    "unrealcefsubprocess",
+    "wineboot",
+    "winedevice",
+    "services",
+    "plugplay",
+    "svchost",
+    "explorer",
+    "rundll32",
+    "regsvr32",
+    "steamerrorreporter",
+    "steamerrorreporter64",
+    "steamservice",
+    "steamwebhelper",
+    "steamtoursfix",
+    "steam_monitor",
+    "steamsysinfo",
+    "steamxboxutil",
+    "steamxboxutil64",
+    "streaming_client",
+    "gameoverlayui64",
+    "gameoverlayui",
+    "writeminidump",
+    "x64launcher",
+    "x86launcher",
+    "secure_desktop_capture",
+    "hardwareupdater",
+    "gldriverquery",
+    "gldriverquery64",
+    "vulkandriverquery",
+    "vulkandriverquery64",
+    "fossilize-replay",
+    "fossilize-replay64",
+    "drivers",
+)
+
+
+class UsageError(Exception):
+    pass
+
+
+class FatalError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# 小工具
+# ---------------------------------------------------------------------------
+
+def warn(msg):
+    sys.stderr.write("appscan: %s\n" % msg)
+
+
+def safe_str(value):
+    """把可能含 surrogate 的字符串变成可安全 JSON 序列化的 UTF-8 文本。"""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        return value.encode("utf-8", "replace").decode("utf-8")
+
+
+def norm_rel(path):
+    return path.replace(os.sep, "/")
+
+
+def mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def atomic_write_bytes(dst, data):
+    dirname = os.path.dirname(dst) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".part", dir=dirname)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dst)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(dst, text):
+    dirname = os.path.dirname(dst) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".part", dir=dirname)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dst)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# PE 图标提取
+# ---------------------------------------------------------------------------
+
+def _u16(buf, off):
+    return struct.unpack_from("<H", buf, off)[0]
+
+
+def _rva_to_off(sections, rva):
+    for vaddr, vsize, rawptr, rawsize in sections:
+        span = vsize if vsize > rawsize else rawsize
+        if vaddr <= rva < vaddr + span:
+            delta = rva - vaddr
+            if delta >= rawsize:
+                return None
+            return rawptr + delta
+    return None
+
+
+def _read_rva(f, sections, rva, size, fsize):
+    if size <= 0 or size > fsize:
+        return None
+    off = _rva_to_off(sections, rva)
+    if off is None or off < 0 or off + size > fsize:
+        return None
+    f.seek(off)
+    data = f.read(size)
+    if len(data) != size:
+        return None
+    return data
+
+
+def _read_dir_entries(f, sections, base, rel_off, fsize):
+    """读资源目录，返回 [(name_id, offset_field), ...]。"""
+    if rel_off < 0 or rel_off > 0x10000000:
+        return []
+    hdr = _read_rva(f, sections, base + rel_off, 16, fsize)
+    if not hdr:
+        return []
+    named = _u16(hdr, 12)
+    ids = _u16(hdr, 14)
+    total = named + ids
+    if total <= 0 or total > 8192:
+        return []
+    raw = _read_rva(f, sections, base + rel_off + 16, total * 8, fsize)
+    if not raw:
+        return []
+    out = []
+    for i in range(total):
+        name_id, off = struct.unpack_from("<II", raw, i * 8)
+        out.append((name_id, off))
+    return out
+
+
+def _pe_sections(f, fsize):
+    """解析 DOS/PE 头，返回 (sections, rsrc_rva, rsrc_size)。"""
+    f.seek(0)
+    dos = f.read(64)
+    if len(dos) < 64 or dos[:2] != b"MZ":
+        return None
+    e_lfanew = struct.unpack_from("<I", dos, 0x3C)[0]
+    if e_lfanew < 64 or e_lfanew + 24 > fsize:
+        return None
+    f.seek(e_lfanew)
+    nt = f.read(24)
+    if len(nt) < 24 or nt[:4] != b"PE\0\0":
+        return None
+    nsec = _u16(nt, 6)
+    optsize = _u16(nt, 20)
+    if nsec <= 0 or nsec > 96 or optsize < 64:
+        return None
+    opt_off = e_lfanew + 24
+    if opt_off + optsize > fsize:
+        return None
+    f.seek(opt_off)
+    opt = f.read(optsize)
+    if len(opt) < optsize:
+        return None
+    magic = _u16(opt, 0)
+    if magic == 0x10B:          # PE32
+        nrva_off, dd_off = 92, 96
+    elif magic == 0x20B:        # PE32+
+        nrva_off, dd_off = 108, 112
+    else:
+        return None
+    if optsize < dd_off + 3 * 8:
+        return None
+    num_rva = struct.unpack_from("<I", opt, nrva_off)[0]
+    if num_rva < 3:
+        return None
+    rsrc_rva, rsrc_size = struct.unpack_from("<II", opt, dd_off + 2 * 8)
+    if rsrc_rva == 0 or rsrc_size == 0:
+        return None
+    # 注意：rsrc_rva 是内存 RVA，不是文件偏移，不能直接与文件大小比较
+    if rsrc_size > fsize:
+        return None
+
+    sec_off = opt_off + optsize
+    if sec_off + nsec * 40 > fsize:
+        return None
+    f.seek(sec_off)
+    raw_secs = f.read(nsec * 40)
+    if len(raw_secs) != nsec * 40:
+        return None
+    sections = []
+    for i in range(nsec):
+        base = i * 40
+        vsize, vaddr, rawsize, rawptr = struct.unpack_from("<IIII", raw_secs, base + 8)
+        sections.append((vaddr, vsize, rawptr, rawsize))
+    return sections, rsrc_rva, rsrc_size
+
+
+def _find_icon_groups(f, sections, base, fsize):
+    """返回 (groups, icons)。groups 为 [(group_id, rva, size)]；icons 为 {id: (rva,size)}。"""
+    groups = []
+    icons = {}
+    for name_id, off in _read_dir_entries(f, sections, base, 0, fsize):
+        if name_id & 0x80000000:        # 命名类型（非 RT_* 数字 id）跳过
+            continue
+        type_id = name_id & 0xFFFF
+        if type_id not in (3, 14):
+            continue
+        if not (off & 0x80000000):
+            continue
+        sub = off & 0x7FFFFFFF
+        for sub_name, sub_off in _read_dir_entries(f, sections, base, sub, fsize):
+            if sub_name & 0x80000000:   # 命名资源不参与（图标都是数字 id）
+                continue
+            res_id = sub_name & 0xFFFF
+            if not (sub_off & 0x80000000):
+                continue
+            lang_off = sub_off & 0x7FFFFFFF
+            leaves = _read_dir_entries(f, sections, base, lang_off, fsize)
+            if not leaves:
+                continue
+            taken = False
+            for _lang, leaf_off in leaves:
+                if leaf_off & 0x80000000:   # 叶子不该再是子目录
+                    continue
+                de = _read_rva(f, sections, base + (leaf_off & 0x7FFFFFFF), 16, fsize)
+                if not de:
+                    continue
+                data_rva, data_size = struct.unpack_from("<II", de, 0)
+                if data_size <= 0 or data_size > MAX_ICON_BYTES:
+                    continue
+                if type_id == 14:
+                    groups.append((res_id, data_rva, data_size))
+                    taken = True
+                else:
+                    if res_id not in icons:
+                        icons[res_id] = (data_rva, data_size)
+                    taken = True
+                if taken:
+                    break
+    return groups, icons
+
+
+def _group_entries(f, sections, rva, size, fsize):
+    """解析 RT_GROUP_ICON 数据，返回 GRPICONDIRENTRY 字典列表。"""
+    data = _read_rva(f, sections, rva, min(size, 65536), fsize)
+    if not data or len(data) < 6:
+        return []
+    if _u16(data, 0) != 0 or _u16(data, 2) != 1:
+        return []
+    count = _u16(data, 4)
+    if count <= 0 or count > 64:
+        return []
+    if len(data) < 6 + count * 14:
+        return []
+    out = []
+    for i in range(count):
+        off = 6 + i * 14
+        bw, bh, bcc, bres, planes, bpp, nbytes, nid = struct.unpack_from(
+            "<BBBBHHIH", data, off)
+        out.append({
+            "width": bw, "height": bh, "colorcount": bcc, "reserved": bres,
+            "planes": planes, "bpp": bpp, "bytes": nbytes, "id": nid,
+        })
+    return out
+
+
+def _sips_ico_to_png(ico_path, png_path):
+    """调 sips 把 .ico 转成 .png，成功返回 True。"""
+    if not os.path.exists(SIPS):
+        return False
+    try:
+        proc = subprocess.run(
+            [SIPS, "-s", "format", "png", ico_path, "--out", png_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except Exception:
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        with open(png_path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return False
+    return head.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def _write_ico(icon_data, entry, icon_dir):
+    """把单条 RT_ICON 位图包成 .ico，返回临时文件路径（调用方负责删除）。"""
+    header = struct.pack("<HHH", 0, 1, 1)
+    dirent = struct.pack(
+        "<BBBBHHII",
+        entry["width"], entry["height"], entry["colorcount"], 0,
+        entry["planes"], entry["bpp"], len(icon_data), 22,
+    )
+    fd, tmp = tempfile.mkstemp(prefix=".ico-", suffix=".ico", dir=icon_dir)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(header)
+            f.write(dirent)
+            f.write(icon_data)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return tmp
+
+
+def icon_cache_path(real_exe):
+    digest = hashlib.sha1(real_exe.encode("utf-8", "replace")).hexdigest()[:16]
+    return os.path.join(ART_APPS_DIR, digest + ".png")
+
+
+def extract_icon(exe_path, real_exe, icon_dir):
+    """提取 exe 的图标到 PNG。返回 (png_path_or_empty, status)。
+
+    status: cached / made / fail
+    """
+    dst = icon_cache_path(real_exe)
+    try:
+        if os.path.isfile(dst) and mtime(dst) >= mtime(exe_path):
+            return dst, "cached"
+    except Exception:
+        pass
+
+    fsize = 0
+    try:
+        fsize = os.path.getsize(exe_path)
+    except OSError:
+        return "", "fail"
+    if fsize <= 0 or fsize > MAX_PE_SIZE:
+        return "", "fail"
+
+    tmp_ico = None
+    tmp_png = None
+    try:
+        with open(exe_path, "rb") as f:
+            parsed = _pe_sections(f, fsize)
+            if not parsed:
+                return "", "fail"
+            sections, rsrc_rva, rsrc_size = parsed
+            groups, icons = _find_icon_groups(f, sections, rsrc_rva, fsize)
+            if not groups or not icons:
+                return "", "fail"
+
+            candidates = []
+            for gid, grva, gsize in groups:
+                for entry in _group_entries(f, sections, grva, gsize, fsize):
+                    aid = entry["id"] & 0xFFFF
+                    if aid not in icons:
+                        continue
+                    area = (entry["width"] or 256) * (entry["height"] or 256)
+                    candidates.append((area, entry["bpp"], gid, aid, entry))
+            if not candidates:
+                return "", "fail"
+            candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+
+            for _area, _bpp, _gid, aid, entry in candidates:
+                irva, isize = icons[aid]
+                icon_data = _read_rva(f, sections, irva, isize, fsize)
+                if not icon_data:
+                    continue
+                if icon_data.startswith(b"\x89PNG"):
+                    # Vista+ 常见：RT_ICON 里直接就是 PNG
+                    atomic_write_bytes(dst, icon_data)
+                    return dst, "made"
+                tmp_ico = _write_ico(icon_data, entry, icon_dir)
+                fd, tmp_png = tempfile.mkstemp(
+                    prefix=".png-", suffix=".png", dir=icon_dir)
+                os.close(fd)
+                if _sips_ico_to_png(tmp_ico, tmp_png):
+                    os.replace(tmp_png, dst)
+                    tmp_png = None
+                    return dst, "made"
+                try:
+                    os.unlink(tmp_png)
+                except OSError:
+                    pass
+                tmp_png = None
+                try:
+                    os.unlink(tmp_ico)
+                except OSError:
+                    pass
+                tmp_ico = None
+            return "", "fail"
+    except Exception:
+        return "", "fail"
+    finally:
+        for tmp in (tmp_ico, tmp_png):
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# 扫描
+# ---------------------------------------------------------------------------
+
+def discover_roots():
+    """返回 [(bottle_name, drive_c_path)]，主 prefix 记为 main。"""
+    roots = []
+    if os.path.isdir(PREFIX_DRIVE_C):
+        roots.append(("main", PREFIX_DRIVE_C))
+    try:
+        names = sorted(os.listdir(BOTTLES_DIR))
+    except OSError:
+        names = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        dc = os.path.join(BOTTLES_DIR, name, "drive_c")
+        if os.path.isdir(dc):
+            roots.append((name, dc))
+    return roots
+
+
+def locate_in_roots(real_path, roots):
+    """返回 (bottle, drive_c, rel) 或 (None, None, None)。"""
+    for bottle, dc in roots:
+        try:
+            rdc = os.path.realpath(dc)
+        except OSError:
+            rdc = dc
+        if real_path == rdc or real_path.startswith(rdc + os.sep):
+            rel = os.path.relpath(real_path, rdc)
+            return bottle, rdc, norm_rel(rel)
+    return None, None, None
+
+
+def load_playtime():
+    try:
+        data = load_json(PLAYTIME_JSON)
+        if isinstance(data, dict):
+            return data
+    except Exception as exc:
+        warn("读取 playtime.json 失败（按 0 处理）: %s" % exc)
+    return {}
+
+
+def playtime_seconds(playtime, appid):
+    if not appid:
+        return 0
+    value = playtime.get(str(appid))
+    if value is None:
+        return 0
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return seconds if seconds > 0 else 0
+
+
+def load_recipes():
+    """读取 recipes/*.json，返回原始记录列表。"""
+    out = []
+    for path in sorted(glob.glob(os.path.join(RECIPES_DIR, "*.json"))):
+        if not os.path.isfile(path):
+            continue
+        try:
+            data = load_json(path)
+        except Exception as exc:
+            warn("跳过无法解析的 recipe %s: %s" % (os.path.basename(path), exc))
+            continue
+        if not isinstance(data, dict):
+            continue
+        appid = str(data.get("appid") or "").strip()
+        if not appid:
+            appid = os.path.basename(path)[:-5]
+        exe = data.get("exe") or ""
+        if not isinstance(exe, str):
+            continue
+        name = str(data.get("name_zh") or data.get("name") or "").strip()
+        if not name:
+            name = "App " + appid
+        out.append({
+            "appid": appid,
+            "name": name,
+            "exe": exe.strip(),
+            "engine": str(data.get("engine") or ""),
+            "publisher": str(data.get("publisher") or ""),
+            "path": path,
+        })
+    return out
+
+
+def _steam_common_dirs(roots, prefix_dc):
+    dirs = []
+    main_common = os.path.join(prefix_dc, STEAM_COMMON_REL)
+    if os.path.isdir(main_common):
+        dirs.append(main_common)
+    for _bottle, dc in roots:
+        common = os.path.join(dc, STEAM_COMMON_REL)
+        if os.path.isdir(common) and common not in dirs:
+            dirs.append(common)
+    return dirs
+
+
+def _strip_wine_prefix(raw, roots, common_dirs):
+    """把 recipe 里可能出现的 Windows 路径拆成候选宿主路径。"""
+    norm = raw.replace("\\", "/").strip().strip('"').strip("'")
+    out = []
+
+    def add(path):
+        if path and path not in out:
+            out.append(path)
+
+    low = norm.lower()
+    # 路径里带 steamapps/common 的，直接截取后半段
+    marker = "steamapps/common/"
+    if marker in low:
+        suffix = norm[low.index(marker) + len(marker):]
+        for common in common_dirs:
+            add(os.path.join(common, suffix))
+    if "drive_c/" in low:
+        suffix = norm[low.index("drive_c/") + len("drive_c/"):]
+        add(os.path.join(PREFIX_DRIVE_C, suffix))
+
+    if re.match(r"^[A-Za-z]:", norm):
+        drive = norm[0].lower()
+        rest = norm[2:].lstrip("/")
+        if drive == "z":
+            add("/" + rest)                     # Wine 里 Z: 映射宿主根
+            for common in common_dirs:
+                add(os.path.join(common, rest))
+        elif drive == "c":
+            for _bottle, dc in roots:
+                add(os.path.join(dc, rest))
+        for common in common_dirs:
+            add(os.path.join(common, rest))
+    elif norm.startswith("/"):
+        add(norm)
+        for _bottle, dc in roots:
+            add(os.path.join(dc, norm.lstrip("/")))
+        for common in common_dirs:
+            add(os.path.join(common, norm.lstrip("/")))
+    else:
+        for common in common_dirs:
+            add(os.path.join(common, norm))
+        add(os.path.join(PREFIX_DRIVE_C, norm))
+    return out
+
+
+def _search_basename(common_dirs, basename, max_depth=4):
+    """兜底：在 steamapps/common 下按文件名找（大小写不敏感）。"""
+    wanted = basename.lower()
+    for common in common_dirs:
+        base_depth = common.rstrip(os.sep).count(os.sep)
+
+        def onerror(_exc):
+            return None
+
+        for dirpath, dirnames, filenames in os.walk(
+                common, topdown=True, onerror=onerror):
+            depth = dirpath.rstrip(os.sep).count(os.sep) - base_depth
+            if depth >= max_depth:
+                dirnames[:] = []
+            for fn in filenames:
+                if fn.lower() == wanted:
+                    return os.path.join(dirpath, fn)
+    return None
+
+
+def resolve_recipe_exe(recipe, roots, common_dirs):
+    raw = recipe["exe"]
+    if not raw:
+        return None
+    for cand in _strip_wine_prefix(raw, roots, common_dirs):
+        try:
+            if os.path.isfile(cand):
+                return os.path.realpath(cand)
+        except OSError:
+            continue
+    # 再来一次按文件名兜底
+    base = raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    if base:
+        found = _search_basename(common_dirs, base)
+        if found:
+            try:
+                return os.path.realpath(found)
+            except OSError:
+                return None
+    return None
+
+
+def classify_path(rel_lower, name_lower, stem_lower):
+    """返回 system / None（仅按路径与文件名规则判断）。"""
+    marked = "/" + rel_lower
+    for marker in SYSTEM_PATH_MARKERS:
+        if marker in marked:
+            return "system"
+    # Steam 自己的内部可执行文件（Steam.exe 之外）都不是给用户点的
+    if "/steam/" in marked and "/steamapps/" not in marked:
+        return "system"
+    for pattern in SYSTEM_NAME_PATTERNS:
+        if pattern.endswith("*"):
+            if stem_lower.startswith(pattern[:-1]) or name_lower.startswith(pattern[:-1]):
+                return "system"
+        elif name_lower == pattern or stem_lower == pattern:
+            return "system"
+    return None
+
+
+def subtitle_for(rel):
+    parts = [p for p in rel.split("/") if p]
+    if len(parts) >= 2:
+        return parts[-2]
+    return ""
+
+
+def slug_for(rel):
+    slug = rel
+    if slug.lower().endswith(".exe"):
+        slug = slug[:-4]
+    return slug.replace("/", "_")
+
+
+def scan(show_all, with_icons, cache_path):
+    t_start = time.time()
+    playtime = load_playtime()
+    roots = discover_roots()
+    if not roots:
+        raise FatalError("找不到任何 Wine prefix 或 bottle（检查 %s）" % PREFIX_DRIVE_C)
+
+    apps = []
+    used_paths = set()      # realpath 去重
+    used_ids = set()
+
+    def add_app(app):
+        rp = app["_real"]
+        if rp in used_paths:
+            return False
+        if app["id"] in used_ids:
+            if app["kind"] in ("game", "steam"):
+                return False
+            app["id"] = app["id"] + "_" + hashlib.sha1(
+                rp.encode("utf-8", "replace")).hexdigest()[:6]
+        used_paths.add(rp)
+        used_ids.add(app["id"])
+        apps.append(app)
+        return True
+
+    # ---- Steam 本体 ----
+    steam_exe = None
+    steam_candidate = os.path.join(PREFIX_DRIVE_C, STEAM_EXE_REL)
+    try:
+        if os.path.isfile(steam_candidate):
+            steam_exe = os.path.realpath(steam_candidate)
+    except OSError:
+        steam_exe = None
+    steam_dir = os.path.join(PREFIX_DRIVE_C, STEAM_REL)
+    if steam_exe is None and os.path.isdir(steam_dir):
+        try:
+            for fn in os.listdir(steam_dir):
+                if fn.lower() == "steam.exe":
+                    cand = os.path.join(steam_dir, fn)
+                    if os.path.isfile(cand):
+                        steam_exe = os.path.realpath(cand)
+                        break
+        except OSError:
+            pass
+    if steam_exe:
+        add_app({
+            "id": "steam",
+            "name": "Steam",
+            "kind": "steam",
+            "exe": steam_exe,
+            "bottle": "main",
+            "appid": "",
+            "icon": "",
+            "seconds": 0,
+            "engine": "",
+            "subtitle": "Valve",
+            "_real": steam_exe,
+            "_rel": STEAM_EXE_REL,
+        })
+
+    # ---- recipes → games ----
+    common_dirs = _steam_common_dirs(roots, PREFIX_DRIVE_C)
+    recipes = load_recipes()
+    for recipe in recipes:
+        real = resolve_recipe_exe(recipe, roots, common_dirs)
+        if not real:
+            warn("recipe %s 的 exe 找不到: %s" % (recipe["appid"], recipe["exe"]))
+            continue
+        bottle, _dc, rel = locate_in_roots(real, roots)
+        if bottle is None:
+            bottle, rel = "main", os.path.basename(real)
+        add_app({
+            "id": "game:" + recipe["appid"],
+            "name": recipe["name"],
+            "kind": "game",
+            "exe": real,
+            "bottle": bottle,
+            "appid": recipe["appid"],
+            "icon": "",
+            "seconds": playtime_seconds(playtime, recipe["appid"]),
+            "engine": recipe["engine"],
+            "subtitle": recipe["publisher"] or subtitle_for(rel),
+            "_real": real,
+            "_rel": rel,
+        })
+
+    # ---- 逐 root 遍历其它 exe ----
+    def walk_error(exc):
+        warn("遍历出错（已跳过）: %s" % exc)
+
+    for bottle, dc in roots:
+        walker = os.walk(dc, topdown=True, followlinks=False, onerror=walk_error)
+        for dirpath, dirnames, filenames in walker:
+            try:
+                depth = dirpath[len(dc):].count(os.sep)
+            except Exception:
+                depth = 0
+            if depth >= MAX_WALK_DEPTH:
+                dirnames[:] = []
+            dirnames.sort()
+            for fn in sorted(filenames):
+                if not fn.lower().endswith(".exe"):
+                    continue
+                full = os.path.join(dirpath, fn)
+                try:
+                    if not os.path.isfile(full):
+                        continue
+                    real = os.path.realpath(full)
+                except OSError:
+                    continue
+                if real in used_paths:
+                    continue
+                b2, _dc2, rel = locate_in_roots(real, roots)
+                if b2 is None:
+                    b2 = bottle
+                    rel = norm_rel(os.path.relpath(full, dc))
+                rel_lower = rel.lower()
+                name_lower = fn.lower()
+                stem_lower = name_lower[:-4] if name_lower.endswith(".exe") else name_lower
+                sub = subtitle_for(rel)
+                name = fn[:-4] if fn.lower().endswith(".exe") else fn
+
+                if rel_lower == STEAM_EXE_REL.lower() or (
+                        name_lower == "steam.exe"
+                        and os.path.basename(os.path.dirname(rel_lower)) == "steam"):
+                    kind = "steam"
+                    appid = ""
+                    name_out = "Steam"
+                    sub = "Valve"
+                    app_id = "steam" if b2 == "main" else "steam:" + b2
+                elif classify_path(rel_lower, name_lower, stem_lower) == "system":
+                    kind = "system"
+                    appid = ""
+                    name_out = name
+                    app_id = "app:%s:%s" % (b2, slug_for(rel))
+                else:
+                    kind = "app"
+                    appid = ""
+                    name_out = name
+                    app_id = "app:%s:%s" % (b2, slug_for(rel))
+                    # 双扩展名等极端情况下 name 为空则用目录名
+                    if not name_out:
+                        name_out = os.path.basename(os.path.dirname(rel)) or fn
+
+                add_app({
+                    "id": app_id,
+                    "name": name_out,
+                    "kind": kind,
+                    "exe": real,
+                    "bottle": b2,
+                    "appid": appid,
+                    "icon": "",
+                    "seconds": 0,
+                    "engine": "",
+                    "subtitle": sub,
+                    "_real": real,
+                    "_rel": rel,
+                })
+
+    # ---- 美术资源：游戏优先用 artfetch 抓回来的 Steam 美术 ----
+    # icon = 方形（简约模式图标墙用），art = 宽图（预览模式封面用）
+    for a in apps:
+        a.setdefault("art", "")
+        if a["kind"] == "game" and a.get("appid"):
+            d = os.path.join(ART_DIR, a["appid"])
+            for fn in ("header.jpg", "capsule.jpg", "cover.jpg"):
+                fp = os.path.join(d, fn)
+                if a.get("art") or not os.path.isfile(fp):
+                    continue
+                a["art"] = fp
+
+    # ---- 过滤 + 排序 ----
+    if not show_all:
+        apps = [a for a in apps if a["kind"] != "system"]
+    apps.sort(key=lambda a: (KIND_WEIGHT.get(a["kind"], 9), a["name"].lower()))
+
+    # ---- 图标 ----
+    icon_stats = {"ok": 0, "fail": 0, "cached": 0, "skipped": 0}
+    if with_icons:
+        try:
+            os.makedirs(ART_APPS_DIR, exist_ok=True)
+        except OSError as exc:
+            raise FatalError("无法创建图标目录 %s: %s" % (ART_APPS_DIR, exc))
+        attempted = 0
+        for app in apps:
+            if app["kind"] == "system":
+                icon_stats["skipped"] += 1
+                continue
+            if app.get("icon"):
+                # 已经有 Steam 缓存的方形图标（artfetch 抓的），不用再解 exe
+                icon_stats["cached"] += 1
+                icon_stats["ok"] += 1
+                continue
+            if attempted >= ICON_LIMIT:
+                icon_stats["skipped"] += 1
+                continue
+            if time.time() - t_start > ICON_BUDGET_SEC:
+                icon_stats["skipped"] += 1
+                continue
+            attempted += 1
+            icon, status = extract_icon(app["exe"], app["_real"], ART_APPS_DIR)
+            if not icon and app.get("appid"):
+                # exe 里解不出图标（比如超大 exe），退回 Steam 缓存的小图标
+                fp = os.path.join(ART_DIR, app["appid"], "icon_square.png")
+                if os.path.isfile(fp):
+                    icon = fp
+                    status = "cached"
+            app["icon"] = icon
+            if status == "made":
+                icon_stats["ok"] += 1
+            elif status == "cached":
+                icon_stats["cached"] += 1
+                icon_stats["ok"] += 1
+            else:
+                icon_stats["fail"] += 1
+        if icon_stats["skipped"] and attempted >= ICON_LIMIT:
+            warn("图标只提取了前 %d 个应用，其余跳过" % ICON_LIMIT)
+        if time.time() - t_start > ICON_BUDGET_SEC:
+            warn("图标提取达到 %.0f 秒预算，剩余跳过" % ICON_BUDGET_SEC)
+
+    # ---- 输出结构 ----
+    out_apps = []
+    for app in apps:
+        out_apps.append({
+            "id": safe_str(app["id"]),
+            "name": safe_str(app["name"]),
+            "kind": app["kind"],
+            "exe": safe_str(app["exe"]),
+            "bottle": safe_str(app["bottle"]),
+            "appid": safe_str(app["appid"]),
+            "icon": safe_str(app["icon"]),
+            "art": safe_str(app.get("art", "")),
+            "seconds": int(app["seconds"]),
+            "engine": safe_str(app["engine"]),
+            "subtitle": safe_str(app["subtitle"]),
+        })
+    result = {
+        "generated": int(time.time()),
+        "count": len(out_apps),
+        "apps": out_apps,
+    }
+
+    # ---- 写缓存 ----
+    cache_dir = os.path.dirname(os.path.abspath(cache_path)) or "."
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError as exc:
+        raise FatalError("无法创建缓存目录 %s: %s" % (cache_dir, exc))
+    text = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
+    try:
+        atomic_write_text(cache_path, text)
+    except OSError as exc:
+        raise FatalError("写缓存失败 %s: %s" % (cache_path, exc))
+
+    if with_icons:
+        warn("图标: 成功 %d（其中缓存 %d），失败 %d，跳过 %d" % (
+            icon_stats["ok"], icon_stats["cached"],
+            icon_stats["fail"], icon_stats["skipped"]))
+    warn("扫描完成: %d 个应用，%.2f 秒" % (len(out_apps), time.time() - t_start))
+    return text
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+USAGE = """用法: appscan [--all] [--no-icons] [--cache PATH]
+
+  --all        连系统组件（kind=system）一起输出
+  --no-icons   不提取 PE 图标
+  --cache PATH 结果缓存路径（默认 $PAY/art/appscan.json）
+"""
+
+
+def parse_args(argv):
+    show_all = False
+    with_icons = True
+    cache = DEFAULT_CACHE
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--all":
+            show_all = True
+        elif arg == "--no-icons":
+            with_icons = False
+        elif arg == "--cache":
+            i += 1
+            if i >= len(argv):
+                raise UsageError("--cache 需要一个路径参数")
+            cache = argv[i]
+        elif arg.startswith("--cache="):
+            cache = arg.split("=", 1)[1]
+            if not cache:
+                raise UsageError("--cache 需要一个路径参数")
+        elif arg in ("-h", "--help"):
+            sys.stdout.write(USAGE)
+            raise SystemExit(0)
+        else:
+            raise UsageError("未知参数: %s" % arg)
+        i += 1
+    return show_all, with_icons, cache
+
+
+def main(argv):
+    try:
+        show_all, with_icons, cache = parse_args(argv)
+    except UsageError as exc:
+        sys.stderr.write("appscan: %s\n\n%s" % (exc, USAGE))
+        return 2
+    if not os.path.isdir(PAY):
+        sys.stderr.write("appscan: 找不到 SteamWine 安装目录: %s\n" % PAY)
+        return 1
+    try:
+        text = scan(show_all, with_icons, cache)
+    except FatalError as exc:
+        sys.stderr.write("appscan: %s\n" % exc)
+        return 1
+    except Exception as exc:  # 兜底：不让任何意外把栈炸到用户脸上
+        sys.stderr.write("appscan: 扫描失败: %s: %s\n" % (type(exc).__name__, exc))
+        return 1
+    try:
+        sys.stdout.buffer.write(text.encode("utf-8"))
+        sys.stdout.buffer.flush()
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        return 0
+    except Exception as exc:
+        sys.stderr.write("appscan: 写 stdout 失败: %s\n" % exc)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

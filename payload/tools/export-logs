@@ -1,0 +1,31 @@
+#!/bin/bash
+# 导出取证包：版本/环境/加速/Steam 日志/游戏日志 → 一个 txt
+set -u
+PAY="$HOME/Library/Application Support/SteamWine"
+OUT="$PAY/logs"; mkdir -p "$OUT"
+TS=$(date +%Y%m%d-%H%M%S)
+F="$OUT/LUVE-日志-$TS.txt"
+{
+  echo "===== LUVE ====="
+  echo "version    : $(sed -n 's/.*"version"[^"]*"\([^"]*\)".*/\1/p' "$PAY/version.json" 2>/dev/null | head -1)"
+  echo "update-src : $(head -1 "$PAY/update-source" 2>/dev/null)"
+  echo "display    : $(head -1 "$PAY/display.mode" 2>/dev/null)"
+  echo "date       : $(date '+%F %T')"
+  echo
+  echo "===== 系统 ====="
+  sw_vers 2>/dev/null; uname -m
+  echo
+  echo "===== 加速 ====="
+  "$PAY/tools/accel" status 2>/dev/null
+  echo
+  echo "===== Steam 日志（末 800 行）====="
+  tail -800 "$HOME/Library/Logs/Steam-Wine.log" 2>/dev/null || echo "(读不到)"
+  echo
+  echo "===== 游戏日志 ====="
+  find "$PAY/SharedSupport/prefix/drive_c/users" -name Player.log -maxdepth 8 2>/dev/null | head -8 | while read -r p; do
+    echo "--- $p ---"
+    tail -150 "$p" 2>/dev/null
+    echo
+  done
+} > "$F" 2>&1
+echo "$F"

@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""gamedoctor — 扫描 Steam 库，识别引擎，生成启动配方（recipe），不改动任何游戏文件。
+用法:
+  gamedoctor scan          扫描库里所有已安装游戏，生成/更新 recipes/*.json
+  gamedoctor apply         由 recipes 重新生成 profiles.conf
+  gamedoctor list          列出已有配方
+"""
+import json, os, re, sys, glob, subprocess, datetime
+
+PAY = os.path.expanduser("~/Library/Application Support/SteamWine")
+PREFIX = os.path.join(PAY, "SharedSupport/prefix")
+STEAM = os.path.join(PREFIX, "drive_c/Program Files (x86)/Steam")
+COMMON = os.path.join(STEAM, "steamapps/common")
+RECIPES = os.path.join(PAY, "recipes")
+PROFILES = os.path.join(PAY, "profiles.conf")
+
+def acf(path):
+    txt = open(path, encoding="utf-8", errors="ignore").read()
+    def g(k):
+        m = re.search(r'"%s"\s+"([^"]*)"' % re.escape(k), txt)
+        return m.group(1) if m else ""
+    return g("appid"), g("name"), g("installdir")
+
+def unity_version(gamedir):
+    for f in glob.glob(os.path.join(gamedir, "*_Data/globalgamemanagers")):
+        try:
+            data = open(f, "rb").read(300000)
+            m = re.search(rb"(20\d\d|6000)\.\d+\.\d+[abfp]\d+", data)
+            if m: return m.group(0).decode()
+        except Exception: pass
+    return ""
+
+def _all_exes(gamedir, depth=3):
+    out = []
+    base = gamedir.rstrip(os.sep).count(os.sep)
+    for root, dirs, files in os.walk(gamedir):
+        if root.count(os.sep) - base > depth:
+            dirs[:] = []
+            continue
+        for f in files:
+            if f.lower().endswith(".exe"):
+                out.append(os.path.join(root, f))
+    return out
+
+def find_exe(gamedir, engine):
+    skip = re.compile(r"(CrashHandler|CrashReport|EpicWebHelper|UnrealCEFSubProcess|vcredist|dxsetup)", re.I)
+    top = [f for f in glob.glob(os.path.join(gamedir, "*.exe")) if not skip.search(os.path.basename(f))]
+    if engine == "Unreal":
+        ship = glob.glob(os.path.join(gamedir, "*/Binaries/Win64/*-Shipping.exe"))
+        pick = top[0] if top else (ship[0] if ship else None)
+    elif engine == "Unity":
+        base = os.path.basename(gamedir).split()[0].lower()
+        cand = [e for e in top if base in os.path.basename(e).lower()]
+        pick = cand[0] if cand else (top[0] if top else None)
+    else:
+        pick = max(top, key=os.path.getsize) if top else None
+    if not pick:
+        cands = [e for e in _all_exes(gamedir) if not skip.search(os.path.basename(e))]
+        pick = max(cands, key=os.path.getsize) if cands else None
+    return pick
+
+def detect_engine(gamedir):
+    if os.path.isdir(os.path.join(gamedir, "Engine")) or glob.glob(os.path.join(gamedir, "*/Binaries/Win64/*-Shipping.exe")) or glob.glob(os.path.join(gamedir, "*.uproject")):
+        return "Unreal", ""
+    if os.path.exists(os.path.join(gamedir, "UnityPlayer.dll")):
+        return "Unity", unity_version(gamedir)
+    if os.path.exists(os.path.join(gamedir, "love.dll")):
+        return "LOVE", ""
+    if os.path.exists(os.path.join(gamedir, "data.win")):
+        return "GameMaker", ""
+    if glob.glob(os.path.join(gamedir, "*.pck")) or os.path.exists(os.path.join(gamedir, "GameAssembly.dll")):
+        return "Godot/IL2CPP", ""
+    return "Unknown", ""
+
+def detect_anticheat(gamedir):
+    pats = re.compile(r"(easyanticheat|battleye|start_protected_game|anticheat|vanguard|ACE-|denuvo)", re.I)
+    hits = []
+    for root, dirs, files in os.walk(gamedir):
+        depth = root[len(gamedir):].count(os.sep)
+        if depth > 3:
+            dirs[:] = []
+            continue
+        for n in files + dirs:
+            if pats.search(n):
+                hits.append(n)
+                if len(hits) >= 3: return sorted(set(hits))
+    return sorted(set(hits))
+
+def sniff_engine(gamedir, exe):
+    try:
+        if not exe or os.path.getsize(exe) > 3 * 1024**3: return ""
+        with open(exe, "rb") as f:
+            head = f.read(12 * 1024**2)
+        for marker, label in ((b"Godot Engine", "Godot"), (b"GameMaker", "GameMaker"),
+                              (b"RPG Maker", "RPG Maker"), (b"NW.js", "NW.js"),
+                              (b"Electron", "Electron"), (b"UnityPlayer", "Unity")):
+            if marker in head: return label
+    except Exception:
+        pass
+    return ""
+
+def args_for(engine, anticheat):
+    if anticheat: return []
+    if engine == "Unreal": return ["-dx12"]
+    return []
+
+def scan():
+    os.makedirs(RECIPES, exist_ok=True)
+    rows = []
+    for acf_path in sorted(glob.glob(os.path.join(STEAM, "steamapps/appmanifest_*.acf"))):
+        appid, name, installdir = acf(acf_path)
+        if not installdir: continue
+        if appid == "228980" or name.startswith("Steamworks"): continue
+        gamedir = os.path.join(COMMON, installdir)
+        if not os.path.isdir(gamedir): continue
+        engine, ver = detect_engine(gamedir)
+        exe = find_exe(gamedir, engine)
+        if not exe: continue
+        if engine == "Unknown":
+            sniffed = sniff_engine(gamedir, exe)
+            if sniffed: engine = sniffed
+        rel = os.path.relpath(exe, COMMON)
+        ac = detect_anticheat(gamedir)
+        old = {}
+        op = os.path.join(RECIPES, appid + ".json")
+        if os.path.exists(op):
+            try: old = json.load(open(op, encoding="utf-8"))
+            except Exception: old = {}
+        recipe = {
+            "appid": appid, "name": name, "engine": engine, "engine_version": ver or None,
+            "exe": rel, "args": args_for(engine, ac),
+            "desktop": "screen" if engine in ("Unreal", "Unity") else "",
+            "anti_cheat": ac or False,
+            "notes": "反作弊：多半跑不起来" if ac else "",
+            "detected_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        for k in ("name_zh", "art", "notes"):
+            if k in old: recipe[k] = old[k]
+        if engine in ("Unreal", "Unity"): recipe["desktop"] = "screen"
+        elif old.get("desktop"): recipe["desktop"] = old["desktop"]
+        json.dump(recipe, open(os.path.join(RECIPES, appid + ".json"), "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=2)
+        rows.append(recipe)
+    apply_profiles()
+    print(f"{'AppID':<9} {'引擎':<12} {'反作弊':<6} 名称")
+    print("-" * 70)
+    for r in rows:
+        eng = r["engine"] + (f" {r['engine_version']}" if r["engine_version"] else "")
+        print(f"{r['appid']:<9} {eng:<12} {'有' if r['anti_cheat'] else '-':<6} {r['name']}")
+    print(f"\n共 {len(rows)} 个，配方在 {RECIPES}")
+    fetch_art()
+
+def fetch_art():
+    """扫完顺手抓封面/图标；失败不影响扫描结果"""
+    tool = os.path.join(PAY, "tools", "artfetch")
+    if not (os.path.exists(tool) and os.access(tool, os.X_OK)):
+        return
+    print("== 抓封面 / 图标 ==")
+    try:
+        subprocess.run([tool], timeout=600)
+    except Exception as e:
+        print(f"  封面抓取跳过：{e}")
+
+def apply_profiles():
+    lines = ["# AppID|相对 steamapps/common 的 exe 路径|启动参数（gamedoctor apply 生成）|桌面策略",
+             "# 第 4 列: screen = 跟着屏幕走（3D 游戏统一用这个）；空 = 不上虚拟桌面"]
+    for f in sorted(glob.glob(os.path.join(RECIPES, "*.json"))):
+        r = json.load(open(f, encoding="utf-8"))
+        d = r.get("desktop", "") or ""
+        # 历史配方里写死的数字统一收敛成 screen，避免换屏幕后尺寸漂移
+        if re.match(r"^\d+x\d+$", d):
+            d = "screen"
+        lines.append(f"{r['appid']}|{r['exe']}|{' '.join(r.get('args', []))}|{d}")
+    open(PROFILES, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+    print(f"已更新 {PROFILES}")
+
+def show():
+    for f in sorted(glob.glob(os.path.join(RECIPES, "*.json"))):
+        r = json.load(open(f, encoding="utf-8"))
+        print(f"{r['appid']}  {r['name']}  [{r['engine']}]  {' '.join(r.get('args', []))}  exe={r['exe']}")
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "list"
+    {"scan": scan, "apply": apply_profiles, "list": show}.get(cmd, lambda: print(__doc__))()

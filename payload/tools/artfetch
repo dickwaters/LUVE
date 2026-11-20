@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""artfetch — 抓 Steam 商店中文名 + 库封面/logo，写进 recipes，并生成 .app 图标。"""
+import json, os, re, subprocess, sys, glob, html, shutil
+
+PAY = os.path.expanduser("~/Library/Application Support/SteamWine")
+RECIPES = os.path.join(PAY, "recipes")
+ART = os.path.join(PAY, "art")
+APPS = os.path.expanduser("~/Applications")
+CJK = re.compile(r"[\u4e00-\u9fff]")
+
+URLS = [
+    ("header.jpg", "https://cdn.cloudflare.steamstatic.com/steam/apps/{id}/header.jpg"),
+    ("capsule.jpg", "https://cdn.cloudflare.steamstatic.com/steam/apps/{id}/capsule_616x353.jpg"),
+    ("cover.jpg", "https://cdn.cloudflare.steamstatic.com/steam/apps/{id}/library_600x900.jpg"),
+    ("hero.jpg", "https://cdn.cloudflare.steamstatic.com/steam/apps/{id}/library_hero.jpg"),
+    ("logo.png", "https://cdn.cloudflare.steamstatic.com/steam/apps/{id}/logo.png"),
+]
+
+APPNAME = {
+    "1943950": "Escape the Backrooms", "2379780": "Balatro", "2835570": "Buckshot Roulette",
+    "4992280": "Haunted Paws", "5269150": "Seikyu", "5315310": "Loftia",
+}
+
+CACHE = os.path.join(PAY, "SharedSupport/prefix/drive_c/Program Files (x86)/Steam/appcache/librarycache")
+
+def from_cache(appid, d):
+    """Steam 客户端自己缓存的封面（离线可用，不怕墙）。文件名是可读的，直接按名字归类。"""
+    src = os.path.join(CACHE, appid)
+    if not os.path.isdir(src):
+        return []
+    best = {}
+    for root, _dirs, files in os.walk(src):
+        for f in files:
+            low = f.lower()
+            if low.startswith("library_header"):
+                best.setdefault("header.jpg", os.path.join(root, f))
+            elif low.startswith("library_capsule"):
+                best.setdefault("capsule.jpg", os.path.join(root, f))
+            elif low.startswith("library_600x900"):
+                best.setdefault("cover.jpg", os.path.join(root, f))
+            elif low.startswith("library_hero") and "blur" not in low:
+                best["hero.jpg"] = os.path.join(root, f)
+            elif low.startswith("logo"):
+                best.setdefault("logo.png", os.path.join(root, f))
+    got = []
+    for name, path in best.items():
+        try:
+            shutil.copyfile(path, os.path.join(d, name))
+            got.append(name)
+        except Exception:
+            pass
+    return got
+
+def fetch(url, out):
+    try:
+        code = subprocess.run(["curl", "-sL", "--max-time", "25", "-o", out, "-w", "%{http_code}", url],
+                              capture_output=True, text=True).stdout.strip()
+        return code == "200" and os.path.getsize(out) > 5000
+    except Exception:
+        return False
+
+def clean_title(t):
+    t = html.unescape(t).strip()
+    t = re.sub(r'^Steam\s*上\s*(的)?\s*', '', t)
+    t = re.sub(r'^\s*在\s*Steam\s*上购买\s*', '', t)
+    t = re.sub(r'\s*(on Steam|auf Steam)\s*$', '', t, flags=re.I)
+    t = re.sub(r'\s*立省\s*\d+%\s*$', '', t)
+    return t.strip()
+
+def page_info(appid):
+    html_path = f"/tmp/steam_{appid}.html"
+    if not fetch(f"https://store.steampowered.com/app/{appid}/?l=schinese", html_path):
+        return "", ""
+    txt = open(html_path, encoding="utf-8", errors="ignore").read()
+    def meta(prop):
+        m = re.search(r'<meta[^>]+property="%s"[^>]+content="([^"]*)"' % prop, txt) or \
+            re.search(r'<meta[^>]+content="([^"]*)"[^>]+property="%s"' % prop, txt)
+        return html.unescape(m.group(1)) if m else ""
+    title = clean_title(meta("og:title"))
+    if not title:
+        m = re.search(r"<title>(.*?)</title>", txt, re.S)
+        if m: title = clean_title(re.sub(r"<[^>]+>", "", m.group(1)))
+    return title, meta("og:image")
+
+def sips_size(path):
+    out = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", path],
+                         capture_output=True, text=True).stdout
+    w = re.search(r"pixelWidth:\s*(\d+)", out); h = re.search(r"pixelHeight:\s*(\d+)", out)
+    return (int(w.group(1)), int(h.group(1))) if w and h else (0, 0)
+
+def app_names(r):
+    """找出这个 appid 在 ~/Applications 里可能对应的 .app 名字（从准到宽）"""
+    out = []
+    if r["appid"] in APPNAME:
+        out.append(APPNAME[r["appid"]])
+    for n in (r.get("name"), r.get("name_zh")):
+        if not n:
+            continue
+        out.append(n)
+        out.append(re.sub(r"\s*(Demo|试玩版)$", "", n).strip())
+    seen, uniq = set(), []
+    for n in out:
+        if n and n not in seen:
+            seen.add(n); uniq.append(n)
+    return uniq
+
+def build_icns(src, out):
+    """把一张方块图转成 .icns"""
+    tmp = "/tmp/artfetch.iconset"
+    subprocess.run(["rm", "-rf", tmp])
+    os.makedirs(tmp, exist_ok=True)
+    for sz in (16, 32, 128, 256, 512):
+        subprocess.run(["sips", "-s", "format", "png", "-z", f"{sz}", f"{sz}", src,
+                        "--out", f"{tmp}/icon_{sz}x{sz}.png"], capture_output=True)
+        d = sz * 2
+        subprocess.run(["sips", "-s", "format", "png", "-z", f"{d}", f"{d}", src,
+                        "--out", f"{tmp}/icon_{sz}x{sz}@2x.png"], capture_output=True)
+    subprocess.run(["iconutil", "-c", "icns", tmp, "-o", out], capture_output=True)
+    return os.path.exists(out)
+
+def make_icns(src, names):
+    """把图标贴到已存在的 .app 上；没有对应的就返回 False"""
+    icns = "/tmp/artfetch-app.icns"
+    if not build_icns(src, icns):
+        return False
+    for name in (names if isinstance(names, list) else [names]):
+        dst = f"{APPS}/{name}.app/Contents/Resources/app.icns"
+        if os.path.exists(dst):
+            subprocess.run(["cp", "-f", icns, dst])
+            subprocess.run(["touch", f"{APPS}/{name}.app"])
+            return True
+    return False
+
+def ensure_app(r, src):
+    """没有 .app 就建一个：双击启动该游戏，图标用抓到的封面"""
+    name = (r.get("name_zh") or re.sub(r"\s*(Demo|试玩版)$", "", r.get("name") or r["appid"])).strip()
+    name = re.sub(r"[:/]", " -", name).strip()          # 冒号/斜杠在 mac 上会变怪字符
+    name = re.sub(r"\s*-+$", "", name).strip()
+    name = re.sub(r"\s{2,}", " ", name)
+    path = f"{APPS}/{name}.app"
+    if os.path.exists(path):
+        return False
+    os.makedirs(f"{path}/Contents/MacOS", exist_ok=True)
+    os.makedirs(f"{path}/Contents/Resources", exist_ok=True)
+    launcher = f"{path}/Contents/MacOS/launcher"
+    with open(launcher, "w", encoding="utf-8") as f:
+        f.write(f'#!/bin/bash\nexec "{PAY}/launch-game.sh" {r["appid"]}\n')
+    os.chmod(launcher, 0o755)
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleDisplayName</key><string>{name}</string>
+<key>CFBundleName</key><string>{name}</string>
+<key>CFBundleExecutable</key><string>launcher</string>
+<key>CFBundleIdentifier</key><string>com.lulu.wine.{r['appid']}</string>
+<key>CFBundleIconFile</key><string>app.icns</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>2.0</string>
+<key>LSMinimumSystemVersion</key><string>11.0</string>
+<key>NSHighResolutionCapable</key><true/>
+</dict></plist>
+"""
+    with open(f"{path}/Contents/Info.plist", "w", encoding="utf-8") as f:
+        f.write(plist)
+    build_icns(src, f"{path}/Contents/Resources/app.icns")
+    return True
+
+def square_crop(src, out):
+    w, h = sips_size(src)
+    if not w or not h: return False
+    side = min(w, h)
+    subprocess.run(["sips", "-c", str(side), str(side), src, "--out", out], capture_output=True)
+    return os.path.exists(out)
+
+def main():
+    os.makedirs(ART, exist_ok=True)
+    for rf in sorted(glob.glob(os.path.join(RECIPES, "*.json"))):
+        r = json.load(open(rf, encoding="utf-8"))
+        appid = r["appid"]
+        d = os.path.join(ART, appid); os.makedirs(d, exist_ok=True)
+        got = from_cache(appid, d)
+        for fname, tpl in URLS:
+            if fname in got:
+                continue
+            out = os.path.join(d, fname)
+            if fetch(tpl.format(id=appid), out):
+                got.append(fname)
+            elif os.path.exists(out) and os.path.getsize(out) > 5000:
+                got.append(fname)          # 以前抓到的正常图，留着
+            elif os.path.exists(out):
+                os.remove(out)             # 404 的垃圾文件
+        title, og_image = page_info(appid)
+        if title and CJK.search(title) and "Steam" not in title:
+            m = re.match(r"([\u4e00-\u9fff0-9：:！!？?·\s]+)", title)
+            r["name_zh"] = (m.group(1).strip() if m else title)
+        elif title:
+            r.setdefault("name_en", title)
+            r.pop("name_zh", None)
+        if "header.jpg" not in got and og_image:
+            out = os.path.join(d, "header.jpg")
+            if fetch(og_image, out) and sips_size(out)[0] > 200:
+                got.append("header.jpg")
+        r["art"] = {f: f"art/{appid}/{f}" for f in got}
+        json.dump(r, open(rf, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        # 图标：优先竖版封面，其次横向
+        for cand in ("cover.jpg", "header.jpg", "capsule.jpg"):
+            src = os.path.join(d, cand)
+            if os.path.exists(src):
+                sq = os.path.join(d, "icon_square.png")
+                if square_crop(src, sq):
+                    if not make_icns(sq, app_names(r)):
+                        if ensure_app(r, sq):
+                            print(f"  + 新建图标 {r.get('name_zh') or r['name']}")
+                break
+        print(f"{appid}  {r.get('name_zh') or r['name']}  art={','.join(got) or '-'}")
+
+if __name__ == "__main__":
+    main()

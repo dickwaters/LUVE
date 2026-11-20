@@ -1,0 +1,489 @@
+#!/bin/bash
+# netpick — Steam 官方更新主机择优（探测 → 写 update_hosts_cached.vdf）
+#
+# 用法:
+#   netpick probe [--json]   并行探测 8 个官方更新主机（HTTPS/HTTP）
+#   netpick apply            按实测结果写 update_hosts_cached.vdf（首次写前备份）
+#   netpick status           一行机器可读状态
+#   netpick restore          从备份还原 update_hosts_cached.vdf
+#
+# 说明:
+#   - 权重：https 最快的 1000000，其次 100000，再次 10000，其余 https 可用的 1000，不可用的 1
+#   ⚠️ 重要：update_hosts_cached.vdf 的 kvsign2 签的是 Hosts 子树。改主机/权重 = 签名必失效，
+#   Steam 会报 'Hosts signature check failed' 并整份丢弃、退回 baked in。
+#   所以默认 apply 不再改写排名（只记录 + 自愈 + 过期刷新），改写要用 force-apply（基本无效）。
+#
+#   - 原文件的 kvsign2 / ClientInfo 段原样保留（保持结构；但 Hosts 内容一改签名就对不上，
+#     Steam 会记 "'Hosts' signature check failed" 并回退内置主机——不会崩，但也别指望一定生效）
+#   - https 写 1；不写 country_codes（避免被区域限制）
+set -u
+
+PAY="$HOME/Library/Application Support/SteamWine"
+STEAM_DIR="$PAY/SharedSupport/prefix/drive_c/Program Files (x86)/Steam"
+VDF="$STEAM_DIR/update_hosts_cached.vdf"
+BAK="$PAY/update_hosts_cached.vdf.orig"
+TARGET="steam_client_win64"
+TOTAL=8
+
+PROBE_DIR=""
+
+usage() {
+  cat <<'EOF'
+用法: netpick <命令>
+  probe [--json]   并行探测 8 个官方更新主机（HTTPS/HTTP，最长约 8 秒）
+  apply            实测官方主机 + 记录排名 + 自愈（被改过就还原）+ 过期就刷新缓存
+  verify           看 Steam 实际用的是缓存列表还是内置列表（要启动过 Steam）
+  status           一行机器可读状态
+  restore          从备份还原 update_hosts_cached.vdf
+  force-apply      【实验】直接改写 vdf 的主机排名 —— 会被 kvsign2 验签拦下，基本无效
+EOF
+}
+
+# host|base_url，顺序固定（输出与 JSON 都按这个顺序）
+hosts_list() {
+  printf '%s\n' \
+    'media.st.dl.eccdnx.com|/client/' \
+    'client-update.queniuqe.com|/' \
+    'client-update.akamai.steamstatic.com|/' \
+    'client-update.fastly.steamstatic.com|/' \
+    'client-update.steamstatic.com|/' \
+    'client-update.steamchina.queniuam.com|/' \
+    'media.st.dl.bscstorage.net|/client/' \
+    'media.st.dl.pinyuncloud.com|/client/'
+}
+
+code_ok() {
+  case "$1" in
+    200|206|304) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 并行探测；结果写到 $PROBE_DIR/results，行格式:
+#   n|host|base_url|https_ok|http_ok|ms
+probe_all() {
+  local d n=0 host base scheme url r f code t
+  d=$(mktemp -d "${TMPDIR:-/tmp}/netpick.XXXXXX") || return 1
+  PROBE_DIR="$d"
+  while IFS='|' read -r host base; do
+    [ -n "${host:-}" ] || continue
+    n=$((n + 1))
+    printf '%s|%s|%s\n' "$n" "$host" "$base" >>"$d/list"
+    for scheme in https http; do
+      url="$scheme://$host$base$TARGET"
+      (
+        r=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' \
+              --http1.1 -m 6 -r 0-2047 "$url" 2>/dev/null) || r="000 0"
+        [ -n "$r" ] || r="000 0"
+        printf '%s\n' "$r" >"$d/$n.$scheme"
+      ) &
+    done
+  done < <(hosts_list)
+  wait
+
+  : >"$d/results"
+  while IFS='|' read -r n host base; do
+    local https_ok=0 http_ok=0 rh rp ms
+    rh=$(cat "$d/$n.https" 2>/dev/null)
+    rp=$(cat "$d/$n.http" 2>/dev/null)
+    [ -n "$rh" ] || rh="000 0"
+    [ -n "$rp" ] || rp="000 0"
+    code="${rh%% *}"
+    code_ok "$code" && https_ok=1
+    code="${rp%% *}"
+    code_ok "$code" && http_ok=1
+    ms=$(awk -v ha="$https_ok" -v hb="$http_ok" \
+             -v ta="${rh##* }" -v tb="${rp##* }" 'BEGIN{
+               m = -1
+               if (ha == 1) m = ta * 1000
+               if (hb == 1) { x = tb * 1000; if (m < 0 || x < m) m = x }
+               if (m < 0) m = 0
+               printf "%d", m + 0.5
+             }')
+    printf '%s|%s|%s|%s|%s|%s\n' "$n" "$host" "$base" "$https_ok" "$http_ok" "$ms" >>"$d/results"
+  done <"$d/list"
+  return 0
+}
+
+count_ok() {
+  awk -F'|' '($4 == 1 || $5 == 1) { n++ } END { print n + 0 }' "$PROBE_DIR/results"
+}
+
+# Steam 客户端更新只走 https，所以真正能用的主机 = https 通的
+count_https_ok() {
+  awk -F'|' '$4 == 1 { n++ } END { print n + 0 }' "$PROBE_DIR/results"
+}
+
+# 最快的主机：优先 https 可用；一个都没有时退回“任一协议可达”
+best_line() {
+  awk -F'|' '
+    {
+      h_ok = ($4 == 1)
+      any_ok = ($4 == 1 || $5 == 1)
+      if (h_ok) {
+        if (hbest == "" || $6 + 0 < hbest) { hbest = $6 + 0; hh = $2 }
+      }
+      if (any_ok) {
+        if (best == "" || $6 + 0 < best) { best = $6 + 0; bh = $2 }
+      }
+    }
+    END {
+      if (hbest != "") print hh "|" hbest
+      else if (best != "") print bh "|" best
+      else print "none|0"
+    }
+  ' "$PROBE_DIR/results"
+}
+
+print_json() {
+  local n host base ho po ms https ok first=1
+  printf '['
+  while IFS='|' read -r n host base ho po ms; do
+    [ "$first" = 1 ] || printf ','
+    first=0
+    if [ "$ho" = 1 ]; then https=true; else https=false; fi
+    if [ "$ho" = 1 ] || [ "$po" = 1 ]; then ok=true; else ok=false; fi
+    printf '{"host":"%s","base_url":"%s","https":%s,"ok":%s,"ms":%s}' \
+      "$host" "$base" "$https" "$ok" "$ms"
+  done <"$PROBE_DIR/results"
+  printf ']\n'
+}
+
+print_table() {
+  local n host base ho po ms hh ph ok msd okc hokc best_host best_ms
+  printf '%-42s %-9s %-6s %-6s %-3s %7s\n' 'HOST' 'BASE' 'HTTPS' 'HTTP' 'OK' 'MS'
+  printf '%-42s %-9s %-6s %-6s %-3s %7s\n' \
+    '------------------------------------------' '---------' '-----' '-----' '--' '------'
+  while IFS='|' read -r n host base ho po ms; do
+    if [ "$ho" = 1 ]; then hh=yes; else hh=no; fi
+    if [ "$po" = 1 ]; then ph=yes; else ph=no; fi
+    if [ "$ho" = 1 ] || [ "$po" = 1 ]; then
+      ok=yes
+      msd="${ms}ms"
+    else
+      ok=no
+      msd="-"
+    fi
+    printf '%-42s %-9s %-6s %-6s %-3s %7s\n' "$host" "$base" "$hh" "$ph" "$ok" "$msd"
+  done <"$PROBE_DIR/results"
+  okc=$(count_ok)
+  hokc=$(count_https_ok)
+  best_host="${BEST_HOST:-}"
+  best_ms="${BEST_MS:-}"
+  if [ "$okc" -gt 0 ]; then
+    printf '\n可达 %s/%s，HTTPS 可用 %s/%s，最快: %s (%sms)\n' \
+      "$okc" "$TOTAL" "$hokc" "$TOTAL" "$best_host" "$best_ms"
+  else
+    printf '\n可达 0/%s，全部不通\n' "$TOTAL"
+  fi
+}
+
+# 从 vdf 里整段照抄一个 {} 块（含 key 行）
+extract_block() {
+  awk -v key="$1" '
+    function ltrim(s) { sub(/^[ \t]+/, "", s); return s }
+    !started {
+      if (ltrim($0) == "\"" key "\"") { started = 1; print; next }
+      next
+    }
+    {
+      print
+      if (!seen) {
+        if (index($0, "{") > 0) { seen = 1; depth = 1 }
+      } else {
+        o = gsub(/{/, "{")
+        c = gsub(/}/, "}")
+        depth += o - c
+        if (depth <= 0) exit
+      }
+    }
+  ' "$2"
+}
+
+cmd_probe() {
+  local want_json=0 bh bm
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) want_json=1 ;;
+      -h|--help) usage; return 0 ;;
+      *) echo "netpick: 未知参数 $1" >&2; usage >&2; return 2 ;;
+    esac
+    shift
+  done
+  echo "并行探测 $TOTAL 个官方更新主机（HTTPS/HTTP，最长约 8 秒）..." >&2
+  probe_all || { echo "netpick: 探测失败" >&2; return 1; }
+  bh=$(best_line)
+  BEST_HOST="${bh%%|*}"
+  BEST_MS="${bh##*|}"
+  if [ "$want_json" = 1 ]; then
+    print_json
+  else
+    print_table
+  fi
+  rm -rf "$PROBE_DIR"
+  PROBE_DIR=""
+  return 0
+}
+
+cmd_force_apply() {
+  local okc bh kvf cif okf badf tmp rep rank=0 ms host base w removed
+  [ -d "$STEAM_DIR" ] || {
+    echo "netpick: 找不到 Steam 目录，无法写入" >&2
+    printf '  %s\n' "$STEAM_DIR" >&2
+    return 2
+  }
+  echo "探测 $TOTAL 个官方更新主机（并行，最长约 8 秒）..." >&2
+  probe_all || { echo "netpick: 探测失败" >&2; return 1; }
+  okc=$(count_https_ok)
+  if [ "$okc" -eq 0 ]; then
+    echo "❌ $TOTAL 个官方更新主机的 HTTPS 全部不通（Steam 更新只走 https），未写入 $VDF" >&2
+    echo "   有主机 HTTP 能连但 HTTPS 不行（证书/端口问题），对 Steam 没用。" >&2
+    echo "   先检查网络/DNS，或单独跑 netpick probe 看看。" >&2
+    rm -rf "$PROBE_DIR"
+    PROBE_DIR=""
+    return 3
+  fi
+
+  # 1) 首次写之前备份原文件
+  if [ -f "$VDF" ]; then
+    if [ ! -f "$BAK" ]; then
+      cp -p "$VDF" "$BAK" && echo "已备份原文件 → $BAK" >&2
+    else
+      echo "备份已存在，不覆盖：$BAK" >&2
+    fi
+  else
+    echo "⚠️ 原 update_hosts_cached.vdf 不存在，没有可备份的内容" >&2
+  fi
+
+  # 2) 抽 kvsign2 / ClientInfo 原段
+  kvf=$(mktemp "${TMPDIR:-/tmp}/netpick.kv.XXXXXX") || return 1
+  cif=$(mktemp "${TMPDIR:-/tmp}/netpick.ci.XXXXXX") || { rm -f "$kvf"; return 1; }
+  if [ -f "$VDF" ]; then
+    extract_block kvsign2 "$VDF" >"$kvf"
+    extract_block ClientInfo "$VDF" >"$cif"
+  fi
+  if [ ! -s "$kvf" ]; then
+    echo "⚠️ 原文件里没有 kvsign2 段，本次不写 kvsign2" >&2
+  fi
+  if [ ! -s "$cif" ]; then
+    echo "⚠️ 原文件里没有 ClientInfo 段，本次不写 ClientInfo" >&2
+  fi
+
+  # 3) 排序：https 可用的按毫秒升序；https 不可用的排后面（Steam 走 https，用不上）
+  okf=$(mktemp "${TMPDIR:-/tmp}/netpick.ok.XXXXXX") || { rm -f "$kvf" "$cif"; return 1; }
+  badf=$(mktemp "${TMPDIR:-/tmp}/netpick.bad.XXXXXX") || { rm -f "$kvf" "$cif" "$okf"; return 1; }
+  awk -F'|' '$4 == 1 { print $6 "|" $2 "|" $3 }' "$PROBE_DIR/results" \
+    | sort -t'|' -k1,1n -k2,2 >"$okf"
+  awk -F'|' '$4 != 1 { print $2 "|" $3 }' "$PROBE_DIR/results" >"$badf"
+
+  # 4) 生成新文件（原子写：同目录 tmp + mv）
+  tmp="$STEAM_DIR/.update_hosts.vdf.tmp.$$"
+  rep=$(mktemp "${TMPDIR:-/tmp}/netpick.rep.XXXXXX") || { rm -f "$kvf" "$cif" "$okf" "$badf"; return 1; }
+  {
+    printf '""\n{\n'
+    printf '\t"serverlist"\n\t{\n'
+    printf '\t\t"Hosts"\n\t\t{\n'
+    printf '\t\t\t"Realms"\n\t\t\t{\n'
+    printf '\t\t\t\t"SteamGlobal"\n\t\t\t\t{\n'
+
+    while IFS='|' read -r ms host base; do
+      [ -n "${host:-}" ] || continue
+      rank=$((rank + 1))
+      case "$rank" in
+        1) w=1000000 ;;
+        2) w=100000 ;;
+        3) w=10000 ;;
+        *) w=1000 ;;
+      esac
+      printf '\t\t\t\t\t"%s"\n' "$host"
+      printf '\t\t\t\t\t{\n'
+      printf '\t\t\t\t\t\t"base_url"\t\t"%s"\n' "$base"
+      printf '\t\t\t\t\t\t"weight"\t\t"%s"\n' "$w"
+      printf '\t\t\t\t\t\t"https"\t\t"1"\n'
+      printf '\t\t\t\t\t}\n'
+      printf '  %d. %-42s %5sms  weight=%s\n' "$rank" "$host" "$ms" "$w" >>"$rep"
+    done <"$okf"
+
+    while IFS='|' read -r host base; do
+      [ -n "${host:-}" ] || continue
+      printf '\t\t\t\t\t"%s"\n' "$host"
+      printf '\t\t\t\t\t{\n'
+      printf '\t\t\t\t\t\t"base_url"\t\t"%s"\n' "$base"
+      printf '\t\t\t\t\t\t"weight"\t\t"1"\n'
+      printf '\t\t\t\t\t\t"https"\t\t"1"\n'
+      printf '\t\t\t\t\t}\n'
+    done <"$badf"
+
+    printf '\t\t\t\t}\n'   # SteamGlobal
+    printf '\t\t\t}\n'     # Realms
+    printf '\t\t}\n'       # Hosts
+    cat "$kvf"             # kvsign2（原样）
+    printf '\t}\n'         # serverlist
+    cat "$cif"             # ClientInfo（原样）
+    printf '}\n'
+  } >"$tmp" || {
+    echo "❌ 生成临时文件失败：$tmp" >&2
+    rm -f "$tmp" "$kvf" "$cif" "$okf" "$badf" "$rep"
+    rm -rf "$PROBE_DIR"; PROBE_DIR=""
+    return 1
+  }
+
+  if ! mv -f "$tmp" "$VDF"; then
+    echo "❌ 原子替换失败：$tmp → $VDF" >&2
+    rm -f "$tmp" "$kvf" "$cif" "$okf" "$badf" "$rep"
+    rm -rf "$PROBE_DIR"; PROBE_DIR=""
+    return 1
+  fi
+
+  echo "已写入：$VDF" >&2
+  echo "权重（https 可用的按实测排序，其余 weight=1）：" >&2
+  sed 's/^/  /' "$rep" >&2
+  removed=$(awk -F'|' 'END { print NR + 0 }' "$badf")
+  http_only=$(awk -F'|' '$4 != 1 && $5 == 1' "$PROBE_DIR/results" | wc -l | tr -d ' ')
+  [ "$removed" -gt 0 ] && echo "  另有 $removed 个主机 https 不可用，weight=1" >&2
+  [ "${http_only:-0}" -gt 0 ] && echo "  其中 $http_only 个是 HTTP 能通、HTTPS 不行（证书/端口问题，Steam 用不上）" >&2
+  [ -f "$BAK" ] && echo "备份：$BAK" >&2
+  echo "⚠️  提醒：Hosts 内容改了之后 kvsign2 会验签失败，Steam 可能报 'Hosts signature check failed'" >&2
+  echo "   然后按 using defaults 回退内置主机（不会崩）。想还原就 netpick restore。" >&2
+
+  rm -f "$kvf" "$cif" "$okf" "$badf" "$rep"
+  rm -rf "$PROBE_DIR"
+  PROBE_DIR=""
+  return 0
+}
+
+# 默认 apply：**不改那份带签名的 Hosts**。
+# 原因：update_hosts_cached.vdf 里的 kvsign2 签的是 Hosts 子树，改了 host 集合/权重签名必然
+# 验不过，Steam 会报 'Hosts signature check failed' 然后整份丢弃、退回 baked in ——
+# 比现状更差或持平，绝不会更好。所以这里只做三件真正有用的事：
+#   1) 实测官方主机，排名记进 steam-hosts.json（纯诊断，Steam 不读它）
+#   2) 万一之前被改过（和备份不一致），还原成 Valve 原始签名版
+#   3) 缓存过期/太旧就删掉，让 Steam 启动时自己拉一份新鲜且签名有效的列表
+cmd_apply() {
+  local bh host ms okc now vu age
+
+  echo "探测 $TOTAL 个官方更新主机（并行，最长约 8 秒）..." >&2
+  probe_all || { echo "netpick: 探测失败" >&2; return 1; }
+  okc=$(count_https_ok)
+  bh=$(best_line)
+  host="${bh%%|*}"
+  ms="${bh##*|}"
+  now=$(date +%s)
+
+  # 1) 排名存档（诊断用）
+  {
+    printf '{\n  "generated": %s,\n  "ok_https": %s,\n  "total": %s,\n  "best": "%s",\n  "best_ms": %s,\n  "ranking": [\n' \
+      "$now" "$okc" "$TOTAL" "$host" "${ms:-0}"
+    awk -F'|' '$4 == 1 { printf "    {\"host\": \"%s\", \"base_url\": \"%s\", \"https\": true, \"ms\": %s},\n", $2, $3, $6 }' \
+      "$PROBE_DIR/results" | sed '$ s/,$//'
+    printf '  ]\n}\n'
+  } > "$PAY/steam-hosts.json" 2>/dev/null || true
+
+  if [ "$okc" -eq 0 ]; then
+    echo "❌ $TOTAL 个官方主机的 HTTPS 全不通 —— 光靠排行救不了，先查网络/DNS 或系统代理" >&2
+    rm -rf "$PROBE_DIR"; PROBE_DIR=""
+    return 3
+  fi
+  echo "实测可达 $okc/${TOTAL}（HTTPS），最快 $host · ${ms}ms" >&2
+
+  # 2) 自愈：被改过就还原成签名有效的原件
+  if [ -f "$VDF" ] && [ -f "$BAK" ] && ! cmp -s "$VDF" "$BAK"; then
+    if cp -p "$BAK" "$VDF"; then
+      echo "已还原：update_hosts_cached.vdf 之前被改过（签名会失效），换回 Valve 原始版"
+    fi
+  fi
+
+  # 3) 只报告，不删：Steam 自己有 CClientJobGetClientUpdateHosts 会到期刷新，
+  #    删掉反而会让它这次直接退回 baked in（日志里 'File not found, using defaults'）
+  if [ -f "$VDF" ]; then
+    vu=$(sed -n 's/.*"valid_until"[[:space:]]*"\([0-9]*\)".*/\1/p' "$VDF" | head -1)
+    if [ -n "${vu:-}" ] && [ "$vu" -lt "$now" ]; then
+      echo "缓存已过期（valid_until ${vu}）—— 不用管，Steam 下次启动会自己刷新成新的签名列表"
+    else
+      echo "缓存有效，签名完整，原样保留"
+    fi
+  else
+    echo "没有缓存文件，Steam 启动时会自己拉一份"
+  fi
+
+  echo "说明：不直接改写主机排名 —— 那份文件带 kvsign2 签名，改了会被 Steam 丢弃。"
+  echo "      排名只记在 $PAY/steam-hosts.json；想确认 Steam 实际用了哪份，跑 netpick verify"
+  rm -rf "$PROBE_DIR"; PROBE_DIR=""
+  return 0
+}
+
+# 看 Steam 实际读的是缓存列表还是内置列表（启动过一次 Steam 之后才有意义）
+cmd_verify() {
+  local bl="$STEAM_DIR/logs/bootstrap_log.txt" blk cached baked
+  [ -f "$bl" ] || { echo "还没跑过 Steam（没有 bootstrap_log.txt），先启动一次再来"; return 1; }
+  if grep -aq "signature check failed" "$bl"; then
+    echo "⚠️ 日志里出现过 'signature check failed' —— Steam 丢过一份缓存"
+  fi
+  # 只看「最后一次启动」那段主机列表，不然会把历史混在一起
+  blk=$(awk '/Using the following download hosts/{b=""} {b=b $0 "\n"} END{printf "%s", b}' "$bl")
+  cached=$(printf '%s' "$blk" | grep -c "source = 'update_hosts_cached.vdf'")
+  baked=$(printf '%s' "$blk" | grep -c "source = 'baked in'")
+  printf 'hosts_cached=%s hosts_baked=%s\n' "${cached:-0}" "${baked:-0}"
+  if [ "${cached:-0}" -gt 0 ]; then
+    echo "→ Steam 正在用缓存的主机列表（$cached 台候选，会自己挑快的）"
+  else
+    echo "→ Steam 只用内置列表（1 台 cdn.steamstatic.com）—— 首次更新会慢，把主机列表补上"
+  fi
+  return 0
+}
+
+cmd_status() {
+  local bh host ms okc applied=no
+  probe_all || { echo "netpick: 探测失败" >&2; return 1; }
+  bh=$(best_line)
+  host="${bh%%|*}"
+  ms="${bh##*|}"
+  okc=$(count_https_ok)
+  # cache 只反映「签名是否完好」：
+  #   ok       = 和备份一致（Valve 原始签名，到期 Steam 自己会刷新，不用管）
+  #   modified = 被改过 → 签名失效，Steam 会丢弃（这才需要修）
+  #   missing  = 没有缓存文件，Steam 会自己拉
+  if [ ! -f "$VDF" ]; then
+    applied=missing
+  elif [ -f "$BAK" ] && ! cmp -s "$VDF" "$BAK"; then
+    applied=modified
+  else
+    applied=ok
+  fi
+  printf 'best=%s ms=%s ok=%s/%s cache=%s\n' "$host" "$ms" "$okc" "$TOTAL" "$applied"
+  rm -rf "$PROBE_DIR"
+  PROBE_DIR=""
+  return 0
+}
+
+cmd_restore() {
+  local tmp
+  [ -d "$STEAM_DIR" ] || {
+    echo "netpick: 找不到 Steam 目录，无法还原" >&2
+    return 2
+  }
+  [ -f "$BAK" ] || {
+    echo "没有备份（$BAK 不存在），无法还原"
+    return 1
+  }
+  tmp="$STEAM_DIR/.update_hosts.vdf.tmp.$$"
+  if cp -p "$BAK" "$tmp" && mv -f "$tmp" "$VDF"; then
+    echo "已从备份还原：$BAK → $VDF"
+    return 0
+  fi
+  rm -f "$tmp"
+  echo "❌ 还原失败" >&2
+  return 1
+}
+
+case "${1:-}" in
+  probe)   shift; cmd_probe "$@" ;;
+  apply)   shift; cmd_apply "$@" ;;
+  force-apply) shift; cmd_force_apply "$@" ;;
+  verify)  shift; cmd_verify "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  restore) shift; cmd_restore "$@" ;;
+  ''|-h|--help|help) usage; [ -n "${1:-}" ] && exit 0 || exit 2 ;;
+  *) echo "netpick: 未知命令 $1" >&2; usage >&2; exit 2 ;;
+esac
+exit $?

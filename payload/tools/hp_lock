@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""把闹鬼爪子的游戏内分辨率钉死，防止游戏自己写回别的值。
+用法:
+  hp_lock            跟随当前屏幕（默认，启动器就是这么调的）
+  hp_lock 1280x832   指定尺寸
+  hp_lock screen     同「跟随屏幕」
+"""
+import subprocess, json, re, os, sys
+P = os.path.expanduser("~/Library/Application Support/SteamWine")
+WINEPREFIX = P + "/SharedSupport/prefix"
+B = P + "/SharedSupport/wswine-dm.bundle"
+W = B + "/bin/wine"
+env = dict(os.environ, WINEPREFIX=WINEPREFIX, WINEDEBUG="-all",
+           DYLD_LIBRARY_PATH=P + "/Frameworks:" + B + "/lib/external",
+           DYLD_FALLBACK_LIBRARY_PATH=P + "/Frameworks:" + B + "/lib/external")
+
+size = sys.argv[1] if len(sys.argv) > 1 else "screen"
+if size.lower() in ("screen", "auto"):
+    try:
+        size = subprocess.run([P + "/tools/screensize"], capture_output=True, text=True).stdout.strip()
+    except Exception:
+        size = ""
+    if not re.match(r"^\d+x\d+$", size or ""):
+        size = "1280x832"
+
+w, h = (int(x) for x in size.lower().split("x"))
+out = subprocess.run([W, "reg", "query", "HKCU\\Software\\LazyFlock\\Haunted Paws"],
+                     capture_output=True, text=True, env=env).stdout
+m = re.search(r"SaveData_h967477940\s+REG_BINARY\s+([0-9a-fA-F]+)", out)
+if not m:
+    sys.exit(0)
+raw = bytes.fromhex(m.group(1))
+d = json.loads(raw.decode("utf-8", "ignore").rstrip("\x00"))
+d.setdefault("settings", {})
+d["settings"]["resolution"] = {"x": w, "y": h}
+d["settings"]["windowMode"] = 2
+new = json.dumps(d, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\x00"
+subprocess.run([W, "reg", "add", "HKCU\\Software\\LazyFlock\\Haunted Paws",
+                "/v", "SaveData_h967477940", "/t", "REG_BINARY", "/d", new.hex(), "/f"],
+               capture_output=True, env=env)
+print(f"locked {w}x{h}")

@@ -1,0 +1,55 @@
+#!/bin/bash
+# bottle — 独立 Wine 环境（APFS 克隆，新瓶几乎不占空间）
+# 用法: bottle list | create <名> | delete <名> | size <名> | ensure-template
+set -u
+PAY="$HOME/Library/Application Support/SteamWine"
+ROOT="$PAY/SharedSupport"
+BOTTLES="$ROOT/bottles"
+TMPL="$ROOT/bottle-template"
+
+list() {
+  echo "main|$ROOT/prefix|$(du -sh "$ROOT/prefix" 2>/dev/null | cut -f1)"
+  [ -d "$BOTTLES" ] || return 0
+  for d in "$BOTTLES"/*/; do
+    [ -d "$d/drive_c" ] || continue
+    n=$(basename "$d")
+    echo "$n|${d%/}|$(du -sh "$d" 2>/dev/null | cut -f1)"
+  done
+}
+
+ensure_template() {
+  if [ -d "$TMPL/drive_c" ]; then return 0; fi
+  echo "首次创建干净模板（约 1 分钟）…"
+  mkdir -p "$TMPL"
+  WINEPREFIX="$TMPL" "$ROOT/wswine-dm.bundle/bin/wine" wineboot -u >/dev/null 2>&1
+  WINEPREFIX="$TMPL" "$ROOT/wswine-dm.bundle/bin/wine" wineboot -s >/dev/null 2>&1
+  [ -d "$TMPL/drive_c" ] || { echo "❌ 模板创建失败"; return 1; }
+}
+
+create() {
+  local name="$1"
+  [ -z "$name" ] && { echo "用法: bottle create <名>"; return 2; }
+  case "$name" in main|template) echo "❌ 名字保留"; return 2;; esac
+  [ -d "$BOTTLES/$name" ] && { echo "❌ 已存在: $name"; return 2; }
+  ensure_template || return 1
+  mkdir -p "$BOTTLES"
+  # APFS 写时复制：克隆不占空间
+  cp -cR "$TMPL" "$BOTTLES/$name" 2>/dev/null || cp -R "$TMPL" "$BOTTLES/$name"
+  [ -d "$BOTTLES/$name/drive_c" ] && echo "✅ 已创建 bottle: $name" || { echo "❌ 创建失败"; return 1; }
+}
+
+del() {
+  local name="$1"
+  case "$name" in ""|main) echo "❌ 不能删除 main"; return 2;; esac
+  [ -d "$BOTTLES/$name" ] || { echo "❌ 不存在: $name"; return 2; }
+  rm -rf "${BOTTLES:?}/$name" && echo "✅ 已删除: $name"
+}
+
+case "${1:-list}" in
+  list) list ;;
+  create) shift; create "${1:-}" ;;
+  delete) shift; del "${1:-}" ;;
+  ensure-template) ensure_template && echo "模板就绪" ;;
+  size) shift; du -sh "$BOTTLES/${1:-}" 2>/dev/null | cut -f1 ;;
+  *) echo "用法: bottle list|create <名>|delete <名>|size <名>|ensure-template" ;;
+esac

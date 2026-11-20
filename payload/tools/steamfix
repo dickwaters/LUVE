@@ -1,0 +1,200 @@
+#!/bin/bash
+# steamfix — 清理会让 Steam 卡住的坏状态
+#
+# 用法:
+#   steamfix status          一行机器可读：runkey=on singletons=2 crash=no
+#   steamfix auto            幂等执行三件清理（自启动项 / 残留锁 / 崩溃标记）
+#   steamfix runkey-off      只删 Run 里的 Steam 自启动项
+#   steamfix runkey-status   只报自启动项状态
+#
+# 原则:
+#   - 不调用 wine reg（慢且会锁 prefix），直接改 user.reg 文本
+#   - 编辑前备份到 user.reg.bak-steamfix（已存在不覆盖），临时文件 + mv 原子写
+#   - 任何一步失败只警告，不中断（exit 0）；只有参数错误 exit 2
+set -u
+
+PAY="$HOME/Library/Application Support/SteamWine"
+PREFIX="$PAY/SharedSupport/prefix"
+REG="$PREFIX/user.reg"
+BAK="$PREFIX/user.reg.bak-steamfix"
+STEAM_DIR="$PREFIX/drive_c/Program Files (x86)/Steam"
+RUN_SECTION='[Software\\Microsoft\\Windows\\CurrentVersion\\Run]'
+export RUN_SECTION
+
+usage() {
+  cat <<'EOF'
+用法: steamfix <命令>
+  status          一行机器可读状态
+  auto            幂等清理：删 Run 里的 Steam 自启动项、清残留锁、清 .crash
+  runkey-off      只删 Run 里的 Steam 自启动项
+  runkey-status   只报自启动项状态
+EOF
+}
+
+warn() { printf '⚠️  %s\n' "$*" >&2; }
+
+runkey_section_exists() {
+  [ -f "$REG" ] || return 1
+  grep -qF "$RUN_SECTION" "$REG" 2>/dev/null
+}
+
+# Run 段里有没有 "Steam" 这个值
+runkey_present() {
+  [ -f "$REG" ] || return 1
+  awk '
+    BEGIN { sec = ENVIRON["RUN_SECTION"] }
+    substr($0, 1, length(sec)) == sec { inrun = 1; next }
+    /^\[/ { inrun = 0 }
+    inrun && /^"Steam"=/ { found = 1; exit }
+    END { exit !found }
+  ' "$REG"
+}
+
+# 打印 Run 段里 Steam 的值（没有就什么都不打）
+runkey_value() {
+  [ -f "$REG" ] || return 1
+  awk '
+    BEGIN { sec = ENVIRON["RUN_SECTION"] }
+    substr($0, 1, length(sec)) == sec { inrun = 1; next }
+    /^\[/ { inrun = 0 }
+    inrun && /^"Steam"=/ { print; exit }
+  ' "$REG"
+}
+
+list_locks() {
+  local f
+  for f in "$STEAM_DIR/htmlcache"/Singleton* \
+           "$STEAM_DIR/htmlcache"/*.lock \
+           "$STEAM_DIR/steamapps/downloading"/*.lock; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    printf '%s\n' "$f"
+  done
+}
+
+count_locks() {
+  local n
+  n=$(list_locks | wc -l | tr -d ' ')
+  printf '%s' "${n:-0}"
+}
+
+delete_runkey() {
+  local tmp
+  runkey_present || return 1
+  if [ ! -f "$BAK" ]; then
+    cp -p "$REG" "$BAK" || { warn "备份 user.reg 失败，未改动"; return 1; }
+    echo "steamfix: 已备份 user.reg → $BAK"
+  fi
+  tmp="$REG.tmp.$$"
+  cp -p "$REG" "$tmp" || { warn "创建临时文件失败"; rm -f "$tmp"; return 1; }
+  if ! awk '
+        BEGIN { sec = ENVIRON["RUN_SECTION"] }
+        substr($0, 1, length(sec)) == sec { inrun = 1; print; next }
+        /^\[/ { inrun = 0 }
+        inrun && /^"Steam"=/ { next }
+        { print }
+      ' "$REG" >"$tmp"; then
+    warn "改写 user.reg 失败（awk）"
+    rm -f "$tmp"
+    return 1
+  fi
+  if mv -f "$tmp" "$REG"; then
+    echo 'steamfix: 已删除 Run 里的 "Steam" 自启动项（不再与静默更新抢文件锁）'
+    return 0
+  fi
+  warn "原子替换 user.reg 失败"
+  rm -f "$tmp"
+  return 1
+}
+
+clean_locks() {
+  local f n=0
+  for f in "$STEAM_DIR/htmlcache"/Singleton* \
+           "$STEAM_DIR/htmlcache"/*.lock \
+           "$STEAM_DIR/steamapps/downloading"/*.lock; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    if rm -f "$f" 2>/dev/null; then
+      n=$((n + 1))
+    else
+      warn "删不掉锁文件：$f"
+    fi
+  done
+  if [ "$n" -gt 0 ]; then
+    echo "steamfix: 已清理 $n 个残留锁文件"
+  else
+    echo "steamfix: 没有残留锁文件"
+  fi
+}
+
+clean_crash() {
+  if [ -e "$STEAM_DIR/.crash" ]; then
+    if rm -f "$STEAM_DIR/.crash" 2>/dev/null; then
+      echo "steamfix: 已删除崩溃标记 .crash"
+    else
+      warn "删不掉 $STEAM_DIR/.crash"
+    fi
+  else
+    echo "steamfix: 没有崩溃标记"
+  fi
+}
+
+cmd_status() {
+  local rk=off sg cr=no
+  if runkey_present; then rk=on; fi
+  sg=$(count_locks)
+  if [ -e "$STEAM_DIR/.crash" ]; then cr=yes; fi
+  printf 'runkey=%s singletons=%s crash=%s\n' "$rk" "$sg" "$cr"
+}
+
+cmd_runkey_status() {
+  if ! [ -f "$REG" ]; then
+    echo "runkey=unknown"
+    return 0
+  fi
+  if runkey_present; then
+    printf 'runkey=on'
+    local v
+    v=$(runkey_value)
+    [ -n "$v" ] && printf ' value=%s' "$v"
+    printf '\n'
+  else
+    echo "runkey=off"
+  fi
+}
+
+cmd_auto() {
+  echo "steamfix: 开始清理（幂等）"
+  # 1) 自启动项
+  if ! [ -f "$REG" ]; then
+    warn "user.reg 不存在，跳过自启动项清理"
+  elif ! runkey_section_exists; then
+    echo 'steamfix: Run 段不存在，没有自启动项可删'
+  elif runkey_present; then
+    delete_runkey || warn "删除自启动项失败（不影响后续步骤）"
+  else
+    echo 'steamfix: Run 里本来就没有 "Steam" 自启动项'
+  fi
+  # 2) 残留锁
+  clean_locks || warn "清理残留锁失败（不影响后续步骤）"
+  # 3) 崩溃标记
+  clean_crash || warn "清理崩溃标记失败"
+  echo "steamfix: 完成"
+  return 0
+}
+
+case "${1:-}" in
+  status)        cmd_status ;;
+  auto)          cmd_auto ;;
+  runkey-off)
+    if ! [ -f "$REG" ]; then
+      echo "steamfix: user.reg 不存在，无法处理"
+    elif runkey_present; then
+      delete_runkey || warn "删除自启动项失败"
+    else
+      echo 'steamfix: Run 里没有 "Steam" 自启动项，无需处理'
+    fi
+    ;;
+  runkey-status) cmd_runkey_status ;;
+  ''|-h|--help|help) usage; [ -n "${1:-}" ] && exit 0 || exit 2 ;;
+  *) echo "steamfix: 未知命令 $1" >&2; usage >&2; exit 2 ;;
+esac
+exit 0

@@ -1,0 +1,329 @@
+#!/bin/bash
+# accel — 让 Wine 里的 Steam 沿用 macOS 系统代理
+#
+# 用法:
+#   accel status    一行机器可读：sysproxy=on:127.0.0.1:7890 wine_proxy=on hosts_residue=no
+#   accel auto      系统代理活着就写进 Wine registry，否则关掉（启动器每次都调这个）
+#   accel on/off    强制开 / 关 Wine 代理
+#   accel clean     清理 /etc/hosts 里 Steam++ 的残留（需要管理员密码；Steam++ 在跑时加 --force）
+#
+# 为什么不桥接 hosts 了:
+#   Wine 的域名解析走 Unix resolver，不读 prefix 里的 hosts，
+#   所以 127.0.0.1 劫持行对 Steam 无效。新版改为设置 Wine 的 WinINet 代理。
+#   prefix 的 hosts 只保留 localhost / steamloopback.host 基础 4 行（原子写）。
+set -u
+
+PAY="$HOME/Library/Application Support/SteamWine"
+PREFIX="$PAY/SharedSupport/prefix"
+WINE_HOSTS="$PREFIX/drive_c/windows/system32/drivers/etc/hosts"
+REG="$PREFIX/user.reg"
+PROXY_BAK="$PAY/accel.proxy.bak"
+SYS_HOSTS=/etc/hosts
+ISEC='[Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings]'
+export ISEC
+DOMAINS='steam|akamai|steampowered|steamstatic|steamcommunity|steampp'
+BASE_LINES=$(printf '127.0.0.1 localhost\n127.0.0.1 steamloopback.host\n::1 localhost\n::1 steamloopback.host')
+
+# 和 env.sh 一样挑引擎，但不 source env.sh（它里面会直接改 hosts，不是原子写）
+ENGINE_NAME=$(head -1 "$PAY/engine" 2>/dev/null | tr -d '[:space:]')
+if [ -n "${ENGINE_NAME:-}" ] && [ -d "$PAY/SharedSupport/engines/$ENGINE_NAME" ]; then
+  ENGINE="$PAY/SharedSupport/engines/$ENGINE_NAME"
+else
+  ENGINE="$PAY/SharedSupport/wswine-dm.bundle"
+fi
+WINE="$ENGINE/bin/wine"
+export WINEPREFIX="$PREFIX"
+export WINEDEBUG=-all
+export DYLD_LIBRARY_PATH="$PAY/Frameworks:$ENGINE/lib/external"
+export DYLD_FALLBACK_LIBRARY_PATH="$DYLD_LIBRARY_PATH"
+export DYLD_FRAMEWORK_PATH="$ENGINE/lib/external"
+
+SP_HOST=""
+SP_PORT=""
+SP_KIND=""
+WP_ENABLE=""
+WP_SERVER=""
+WP_OVERRIDE=""
+
+usage() {
+  cat <<'EOF'
+用法: accel <命令>
+  status    一行机器可读状态
+  auto      有可用系统代理就写进 Wine，否则关掉
+  on        强制启用（读取 macOS 系统代理）
+  off       强制关闭（ProxyEnable=0）
+  clean     清理 /etc/hosts 里 Steam++ 残留 [--force]
+EOF
+}
+
+warn() { printf '⚠️  %s\n' "$*" >&2; }
+
+# 原子写 Wine 的 hosts：只写基础 4 行
+write_hosts_base() {
+  local dir tmp
+  dir=$(dirname "$WINE_HOSTS")
+  mkdir -p "$dir" 2>/dev/null || { warn "建不了目录：$dir"; return 1; }
+  tmp=$(mktemp "$dir/.hosts.accel.XXXXXX") || { warn "mktemp 失败：$dir"; return 1; }
+  printf '%s\n' "$BASE_LINES" >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 644 "$tmp" 2>/dev/null
+  if [ -f "$WINE_HOSTS" ] && cmp -s "$tmp" "$WINE_HOSTS"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  mv -f "$tmp" "$WINE_HOSTS" || { rm -f "$tmp"; warn "原子替换 hosts 失败"; return 1; }
+  return 0
+}
+
+# prefix hosts 里还有没有 127.0.0.1 / ::1 劫持行（基础 4 行之外）
+prefix_hosts_residue() {
+  [ -f "$WINE_HOSTS" ] || return 1
+  awk '
+    /^[ \t]*#/ { next }
+    NF < 2 { next }
+    $1 == "127.0.0.1" || $1 == "::1" {
+      if ($2 != "localhost" && $2 != "steamloopback.host") { bad = 1 }
+    }
+    END { exit !bad }
+  ' "$WINE_HOSTS"
+}
+
+# 解析 scutil --proxy（输出形如 "  HTTPProxy : 127.0.0.1"）
+sysproxy_read() {
+  local out h p
+  SP_HOST=""; SP_PORT=""; SP_KIND=""
+  out=$(scutil --proxy 2>/dev/null) || return 1
+  h=$(printf '%s\n' "$out" | awk '/^[[:space:]]*HTTPSProxy[[:space:]]*:/ { print $3; exit }')
+  p=$(printf '%s\n' "$out" | awk '/^[[:space:]]*HTTPSPort[[:space:]]*:/ { print $3; exit }')
+  if [ -n "${h:-}" ] && [ -n "${p:-}" ]; then
+    SP_HOST="$h"; SP_PORT="$p"; SP_KIND=https
+    return 0
+  fi
+  h=$(printf '%s\n' "$out" | awk '/^[[:space:]]*HTTPProxy[[:space:]]*:/ { print $3; exit }')
+  p=$(printf '%s\n' "$out" | awk '/^[[:space:]]*HTTPPort[[:space:]]*:/ { print $3; exit }')
+  if [ -n "${h:-}" ] && [ -n "${p:-}" ]; then
+    SP_HOST="$h"; SP_PORT="$p"; SP_KIND=http
+    return 0
+  fi
+  return 1
+}
+
+sp_alive() {
+  [ -n "${SP_HOST:-}" ] && [ -n "${SP_PORT:-}" ] || return 1
+  nc -z -G 1 "$SP_HOST" "$SP_PORT" >/dev/null 2>&1
+}
+
+# 从 user.reg 读 Internet Settings（不启动 wine，快且不锁 prefix）
+read_proxy_enable_hex() {
+  [ -f "$REG" ] || return 1
+  awk '
+    BEGIN { sec = ENVIRON["ISEC"] }
+    substr($0, 1, length(sec)) == sec { ins = 1; next }
+    /^\[/ { ins = 0 }
+    ins && /^"ProxyEnable"=dword:/ {
+      v = $0
+      sub(/^.*dword:/, "", v)
+      sub(/[^0-9a-fA-F].*$/, "", v)
+      print v
+      exit
+    }
+  ' "$REG"
+}
+
+read_proxy_string() {
+  [ -f "$REG" ] || return 1
+  awk -v key="\"$1\"=" '
+    BEGIN { sec = ENVIRON["ISEC"] }
+    substr($0, 1, length(sec)) == sec { ins = 1; next }
+    /^\[/ { ins = 0 }
+    ins && index($0, key) == 1 {
+      v = substr($0, length(key) + 1)
+      sub(/^"/, "", v)
+      sub(/"$/, "", v)
+      print v
+      exit
+    }
+  ' "$REG"
+}
+
+wine_proxy_read() {
+  local hex
+  WP_ENABLE=""; WP_SERVER=""; WP_OVERRIDE=""
+  [ -f "$REG" ] || return 1
+  hex=$(read_proxy_enable_hex) || hex=""
+  if [ -n "${hex:-}" ]; then
+    WP_ENABLE=$((16#$hex))
+  fi
+  WP_SERVER=$(read_proxy_string ProxyServer) || WP_SERVER=""
+  WP_OVERRIDE=$(read_proxy_string ProxyOverride) || WP_OVERRIDE=""
+  return 0
+}
+
+# 首次修改前保存原始值
+save_proxy_backup() {
+  [ -f "$PROXY_BAK" ] && return 0
+  wine_proxy_read
+  {
+    printf '# accel 原始 Internet Settings（%s 首次修改前保存）\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'ProxyEnable=%s\n' "${WP_ENABLE:-0}"
+    printf 'ProxyServer=%s\n' "${WP_SERVER:-}"
+    printf 'ProxyOverride=%s\n' "${WP_OVERRIDE:-}"
+  } >"$PROXY_BAK" 2>/dev/null || { warn "写不了备份：$PROXY_BAK"; return 1; }
+  return 0
+}
+
+# 带 20s 超时跑一条命令（macOS 没有 coreutils timeout）
+run_limited() {
+  local secs=$1 p i=0 max
+  shift
+  "$@" >/dev/null 2>&1 &
+  p=$!
+  max=$((secs * 2))
+  while kill -0 "$p" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -ge "$max" ]; then
+      kill -9 "$p" 2>/dev/null
+      wait "$p" 2>/dev/null
+      return 124
+    fi
+    sleep 0.5
+  done
+  wait "$p"
+}
+
+reg_set() {
+  local name=$1 type=$2 data=$3 rc
+  run_limited 20 "$WINE" reg add \
+    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" \
+    /v "$name" /t "$type" /d "$data" /f
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "Wine registry 写入失败：$name (rc=$rc)"
+  fi
+  return "$rc"
+}
+
+proc_running() { pgrep -f 'Steam\+\+' >/dev/null 2>&1 || pgrep -fi 'watt' >/dev/null 2>&1; }
+local_proxy_alive() {
+  local p
+  for p in 443 80; do
+    nc -z -G 1 127.0.0.1 "$p" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+sys_hosts_residue() {
+  grep -qE '^# *Steam\+\+ *Start' "$SYS_HOSTS" 2>/dev/null && return 0
+  grep -viE 'steamloopback' "$SYS_HOSTS" 2>/dev/null \
+    | grep -qiE "127\.0\.0\.1[[:space:]]+[^ ]*($DOMAINS)"
+}
+
+cmd_status() {
+  local sp=off wp=off res=no
+  if sysproxy_read && sp_alive; then
+    sp="on:$SP_HOST:$SP_PORT"
+  fi
+  if wine_proxy_read; then
+    if [ "${WP_ENABLE:-}" = "1" ]; then wp=on; fi
+  fi
+  if prefix_hosts_residue; then res=yes; fi
+  printf 'sysproxy=%s wine_proxy=%s hosts_residue=%s\n' "$sp" "$wp" "$res"
+}
+
+cmd_on() {
+  local hp ok=1
+  if ! sysproxy_read; then
+    echo "macOS 没有配置 HTTP/HTTPS 系统代理，无法启用"
+    return 1
+  fi
+  if ! sp_alive; then
+    echo "系统代理 $SP_HOST:$SP_PORT 没在监听，无法启用"
+    return 1
+  fi
+  save_proxy_backup
+  hp="$SP_HOST:$SP_PORT"
+  reg_set ProxyEnable REG_DWORD 1 || ok=0
+  reg_set ProxyServer REG_SZ "http=$hp;https=$hp" || ok=0
+  reg_set ProxyOverride REG_SZ 'localhost;127.0.0.1;<local>' || ok=0
+  write_hosts_base || { warn "写 Wine hosts 失败"; ok=0; }
+  if [ "$ok" = 1 ]; then
+    echo "✅ 已让 Wine 走系统代理：${hp}（ProxyEnable=1）"
+    echo "   Wine hosts 已归位，只剩 localhost / steamloopback.host"
+    return 0
+  fi
+  echo "⚠️ 有设置没写成功，详见上面的警告"
+  return 1
+}
+
+cmd_off() {
+  local ok=1 had=0
+  wine_proxy_read
+  if [ -z "${WP_ENABLE:-}" ] || [ "${WP_ENABLE:-}" = "0" ]; then
+    echo "Wine 代理本来就是关的（ProxyEnable=0），没动 registry"
+  else
+    save_proxy_backup
+    reg_set ProxyEnable REG_DWORD 0 || ok=0
+    [ "$ok" = 1 ] && echo "已关闭 Wine 代理（ProxyEnable=0；ProxyServer/ProxyOverride 没动）"
+  fi
+  prefix_hosts_residue && had=1
+  write_hosts_base || { warn "写 Wine hosts 失败"; ok=0; }
+  if [ "$had" = 1 ]; then
+    echo "已清掉 Wine hosts 里的 127.0.0.1 劫持行，只剩基础 4 行"
+  fi
+  [ "$ok" = 1 ]
+}
+
+cmd_auto() {
+  if sysproxy_read && sp_alive; then
+    cmd_on
+    return $?
+  fi
+  cmd_off
+  return $?
+}
+
+cmd_clean() {
+  local force=0 tmp rc
+  [ "${1:-}" = "--force" ] && force=1
+
+  # 顺手把 Wine hosts 归位（不需要管理员密码）
+  if write_hosts_base; then
+    echo "Wine hosts 已归位（localhost / steamloopback.host 4 行）"
+  else
+    warn "Wine hosts 归位失败"
+  fi
+
+  if ! sys_hosts_residue; then
+    echo "/etc/hosts 里没有 Steam++ 残留"
+    return 0
+  fi
+  if proc_running || local_proxy_alive; then
+    if [ "$force" != 1 ]; then
+      echo "❌ Steam++ 正在运行，现在清理会同时影响 Mac 原生 Steam 的加速。"
+      echo "   请先在 Steam++ 里关掉加速（或退出它），再回来清理；"
+      echo "   确认要强清就加 --force。"
+      return 3
+    fi
+    echo "⚠️ 强制清理：Steam++ 正在运行"
+  fi
+  tmp=$(mktemp "${TMPDIR:-/tmp}/accel.hosts.XXXXXX") || return 1
+  awk '/^# *Steam\+\+ *Start/{skip=1} !skip{print} /^# *Steam\+\+ *End/{skip=0}' "$SYS_HOSTS" >"$tmp"
+  if osascript -e "do shell script \"cp '$tmp' '$SYS_HOSTS'\" with administrator privileges" >/dev/null 2>&1; then
+    echo "✅ 已清理 /etc/hosts 里的 Steam++ 残留"
+    rc=0
+  else
+    echo "❌ 取消或失败（需要管理员密码）"
+    rc=1
+  fi
+  rm -f "$tmp"
+  return "$rc"
+}
+
+case "${1:-}" in
+  status) shift; cmd_status ;;
+  auto)   shift; cmd_auto ;;
+  on)     shift; cmd_on ;;
+  off)    shift; cmd_off ;;
+  clean)  shift; cmd_clean "$@" ;;
+  ''|-h|--help|help) usage; [ -n "${1:-}" ] && exit 0 || exit 2 ;;
+  *) echo "accel: 未知命令 $1" >&2; usage >&2; exit 2 ;;
+esac
+exit $?

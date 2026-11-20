@@ -1,0 +1,22 @@
+#!/bin/bash
+# runexe — 用 LUVE 自己的 Wine 运行安装包，不经过系统文件关联
+# 按扩展名分派：.exe → wine，.msi → msiexec，.bat/.cmd → cmd /c，.reg → regedit
+set -u
+PAY="$HOME/Library/Application Support/SteamWine"
+[ $# -ge 1 ] || { echo "用法: runexe <安装包路径> [参数...]"; exit 2; }
+F="$1"; shift
+[ -f "$F" ] || { echo "找不到文件: $F"; exit 2; }
+# shellcheck disable=SC1091
+source "$PAY/env.sh"
+
+# Wine 要 Windows 路径：用 Z: 映射
+WP="Z:$(printf '%s' "$F" | tr '/' '\\')"
+EXT="$(printf '%s' "${F##*.}" | tr '[:upper:]' '[:lower:]')"
+
+echo "用 Wine 运行 ($EXT): $F"
+case "$EXT" in
+  msi)      exec "$WINE" msiexec /i "$WP" "$@" ;;
+  bat|cmd)  exec "$WINE" cmd /c "$WP" "$@" ;;
+  reg)      exec "$WINE" regedit "$WP" "$@" ;;
+  *)        exec "$WINE" "$WP" "$@" ;;
+esac

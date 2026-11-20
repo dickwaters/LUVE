@@ -1,0 +1,6 @@
+.DS_Store
+__MACOSX/
+payload/SharedSupport/
+payload/Frameworks/
+*.zip.part*
+LUVE-3.0.0.zip

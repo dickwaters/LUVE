@@ -1,0 +1,7 @@
+本包含三部分：
+1. Wine（LGPL-2.1+）          —— 源码见 https://github.com/wine-mirror/wine
+2. Apple D3DMetal / GPTK      —— 见 Apple-GamePortingToolkit-License.rtf，
+                                 仅允许「非商业分发」：可免费分享，不得售卖
+3. 本项目的启动器与前端        —— 随包自由分发
+
+包内不含：Steam 客户端本体、任何游戏本体、任何账号登录信息。
